@@ -355,7 +355,6 @@ class TestExtractSegmentsToWav:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_speech_wav: Path
     ) -> None:
         """Force trim_silence to return a sub-1s array; segment must be dropped."""
-        import voicelegacy.corpus as corpus_mod
         from voicelegacy.config import XTTS_INPUT_SR, ReferenceConfig
         from voicelegacy.corpus import SegmentRef, extract_segments_to_wav
 
@@ -363,7 +362,9 @@ class TestExtractSegmentsToWav:
             # Return less than 1 second
             return y[: int(XTTS_INPUT_SR * 0.3)]
 
-        monkeypatch.setattr(corpus_mod, "trim_silence", aggressive_trim)
+        # trim_silence now lives in the canonical audio.clean_segment chain (the
+        # DRY refactor in Fase 2), so patch it where it is actually called.
+        monkeypatch.setattr("voicelegacy.audio.trim_silence", aggressive_trim)
         config = ReferenceConfig(
             apply_denoise=False,
             apply_bandpass_filter=False,

@@ -45,6 +45,7 @@ class QualityReport:
             "rms_db": round(self.stats.rms_db, 2),
             "peak_db": round(self.stats.peak_db, 2),
             "snr_db": round(self.stats.snr_db, 2),
+            "spectral_rolloff_hz": round(self.stats.spectral_rolloff_hz, 1),
             "score": round(self.score, 4),
             "passed": self.passed,
             "reasons": list(self.reasons),
@@ -57,6 +58,7 @@ def score_segment(
     max_duration_s: float = MAX_REF_DURATION_S,
     min_snr_db: float = MIN_SNR_DB,
     min_sr_hz: int = MIN_SAMPLING_RATE_HZ,
+    min_spectral_rolloff_hz: float = 0.0,
 ) -> tuple[float, bool, tuple[str, ...]]:
     """Score an audio segment against quality gates.
 
@@ -92,6 +94,13 @@ def score_segment(
     # Hard gates
     if stats.sample_rate < min_sr_hz:
         reasons.append(f"sample_rate {stats.sample_rate}Hz < {min_sr_hz}Hz (phone-codec audio)")
+    if min_spectral_rolloff_hz > 0.0 and stats.spectral_rolloff_hz < min_spectral_rolloff_hz:
+        # Catches telephone-band audio that was upsampled: the header sample
+        # rate looks fine but the measured bandwidth is narrow.
+        reasons.append(
+            f"spectral rolloff {stats.spectral_rolloff_hz:.0f}Hz < "
+            f"{min_spectral_rolloff_hz:.0f}Hz (narrowband/telephone audio)"
+        )
     if stats.duration_s < min_duration_s:
         reasons.append(f"duration {stats.duration_s:.2f}s < {min_duration_s}s")
     if stats.duration_s > max_duration_s:
@@ -126,6 +135,7 @@ def evaluate_file(
     max_duration_s: float | None = None,
     min_snr_db: float | None = None,
     min_sr_hz: int = MIN_SAMPLING_RATE_HZ,
+    min_spectral_rolloff_hz: float | None = None,
     target_sr: int = XTTS_INPUT_SR,
 ) -> QualityReport:
     """Load an audio file and produce a full quality report.
@@ -161,6 +171,11 @@ def evaluate_file(
             max_duration_s if max_duration_s is not None else config.max_segment_duration_s
         )
         effective_min_snr = min_snr_db if min_snr_db is not None else config.min_snr_db
+        effective_min_rolloff = (
+            min_spectral_rolloff_hz
+            if min_spectral_rolloff_hz is not None
+            else config.min_spectral_rolloff_hz
+        )
     else:
         effective_min_duration = (
             min_duration_s if min_duration_s is not None else MIN_REF_DURATION_S
@@ -169,6 +184,9 @@ def evaluate_file(
             max_duration_s if max_duration_s is not None else MAX_REF_DURATION_S
         )
         effective_min_snr = min_snr_db if min_snr_db is not None else MIN_SNR_DB
+        effective_min_rolloff = (
+            min_spectral_rolloff_hz if min_spectral_rolloff_hz is not None else 0.0
+        )
 
     y, original_sr = load_audio_mono(path, target_sr=target_sr)
     # Pass original_sr so AudioStats.sample_rate reflects the SOURCE rate, not
@@ -181,6 +199,7 @@ def evaluate_file(
         max_duration_s=effective_max_duration,
         min_snr_db=effective_min_snr,
         min_sr_hz=min_sr_hz,
+        min_spectral_rolloff_hz=effective_min_rolloff,
     )
     return QualityReport(path=path, stats=stats, score=score, passed=passed, reasons=reasons)
 
@@ -202,3 +221,92 @@ def rank_candidates(reports: list[QualityReport], top_n: int = 10) -> list[Quali
 
     passing.sort(key=lambda r: r.score, reverse=True)
     return passing[:top_n]
+
+
+def select_reference_wavs(
+    corpus_dir: Path,
+    config: ReferenceConfig | None = None,
+    *,
+    top_n: int | None = None,
+) -> list[Path]:
+    """Pick the reference WAVs to feed XTTS conditioning, best-quality first.
+
+    Rationale: ``run_reference_phase`` writes *every* filtered segment to
+    ``reference_corpus/`` and only records its top-N ranking in a JSON
+    report. Until v0.7.1 the synthesis CLIs then globbed the directory
+    alphabetically — i.e. chronologically by ``{source}_{idx}_{start}`` —
+    so (a) segments that FAILED the SNR/clipping gate were still used for
+    conditioning, and (b) XTTS's GPT-style latent, computed from the
+    leading ``gpt_cond_len`` seconds, was dominated by whichever segments
+    sorted first rather than the best ones. This helper closes that gap by
+    re-scoring the directory at synthesis time (cheap: stats only, no GPU)
+    and returning the ranked top-N.
+
+    Args:
+        corpus_dir: Directory containing candidate reference WAVs.
+        config: Optional :class:`ReferenceConfig` supplying gate thresholds
+            and the default ``top_n_segments``. Defaults are used when None.
+        top_n: How many to keep. ``None`` → ``config.top_n_segments``;
+            ``0`` → legacy behavior (ALL wavs, alphabetical), kept as an
+            explicit escape hatch for A/B comparison against old outputs.
+
+    Returns:
+        Ranked list (best first), or the legacy alphabetical list when
+        ``top_n=0`` or when *no* candidate passes the gates (fail-open with
+        a loud warning: for a family archive, degraded synthesis beats a
+        hard stop — the warning tells the user to fix the corpus).
+    """
+    cfg = config or ReferenceConfig()
+    all_wavs = sorted(corpus_dir.glob("*.wav"))
+    if not all_wavs:
+        return []
+
+    effective_top_n = cfg.top_n_segments if top_n is None else top_n
+    if effective_top_n == 0:
+        logger.warning(
+            "top_n=0: using ALL {} reference WAVs in alphabetical order "
+            "(legacy pre-0.7.1 behavior; quality ranking bypassed).",
+            len(all_wavs),
+        )
+        return all_wavs
+
+    # Per-file fault isolation: one corrupt/unreadable WAV in the directory
+    # must not kill synthesis. Unreadable files are excluded from BOTH the
+    # ranking and the fallback pool — feeding undecodable bytes to XTTS
+    # conditioning is never the right outcome.
+    reports = []
+    loadable: list[Path] = []
+    for wav in all_wavs:
+        try:
+            reports.append(evaluate_file(wav, config=cfg))
+            loadable.append(wav)
+        except Exception as exc:
+            logger.warning("Skipping unreadable reference WAV {}: {}", wav.name, exc)
+    if not loadable:
+        logger.error(
+            "None of the {} reference WAV(s) in {} could be decoded. Rebuild the corpus.",
+            len(all_wavs),
+            corpus_dir,
+        )
+        return []
+    ranked = rank_candidates(reports, top_n=effective_top_n)
+    if not ranked:
+        logger.warning(
+            "No reference WAV passed the quality gates (SNR >= {} dB, "
+            "duration {}–{} s). Falling back to ALL {} candidates — expect "
+            "degraded cloning; rebuild the corpus with better source audio.",
+            cfg.min_snr_db,
+            cfg.min_segment_duration_s,
+            cfg.max_segment_duration_s,
+            len(loadable),
+        )
+        return loadable
+
+    selected = [r.path for r in ranked]
+    logger.info(
+        "Selected top {} of {} reference WAVs by quality score (best first: {}).",
+        len(selected),
+        len(all_wavs),
+        selected[0].name,
+    )
+    return selected

@@ -180,6 +180,51 @@ class ReferenceConfig(BaseModel):
         le=60.0,
         description="Reject segments below this SNR.",
     )
+    # ── Fase 2 precision levers (all default to current behavior; opt-in) ──
+    # These are precision knobs: leave them off until you have a benchmark
+    # baseline to A/B against. Enabling any of them changes which segments are
+    # selected, which is a precision change the golden rule says must be measured.
+    denoise_only_if_noisy: bool = Field(
+        default=False,
+        description=(
+            "If True, denoise is applied only to segments whose estimated "
+            "dynamic range is below denoise_snr_threshold_db. Denoising already "
+            "clean speech adds artifacts; this avoids it. Default False keeps the "
+            "current unconditional behavior."
+        ),
+    )
+    denoise_snr_threshold_db: float = Field(
+        default=25.0,
+        ge=0.0,
+        le=60.0,
+        description="Below this estimated dynamic range a segment is denoised "
+        "(only consulted when denoise_only_if_noisy is True).",
+    )
+    enable_overlap_filter: bool = Field(
+        default=False,
+        description=(
+            "If True, drop target-speaker segments that overlap in time with "
+            "other speakers beyond max_overlap_ratio. Crosstalk contaminates the "
+            "reference. Mirrors enable_f0_outlier_filter; default off."
+        ),
+    )
+    max_overlap_ratio: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Max fraction of a target segment allowed to overlap other "
+        "speakers before it is rejected (only when enable_overlap_filter).",
+    )
+    min_spectral_rolloff_hz: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=24000.0,
+        description=(
+            "Reject segments whose measured 85%% spectral rolloff is below this "
+            "(detects telephone-band audio that was upsampled, which the header "
+            "sample-rate gate cannot catch). 0 disables this gate (default)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_duration_range(self) -> ReferenceConfig:
@@ -294,6 +339,63 @@ class SynthesisConfig(BaseModel):
             "succeeds and the sidecar records similarity_status='skipped'."
         ),
     )
+    # ── Speaker-conditioning knobs ────────────────────────────────────
+    # Defaults deliberately mirror upstream XttsConfig (idiap coqui-ai-TTS):
+    # gpt_cond_len=12, gpt_cond_chunk_len=4, max_ref_len=10,
+    # sound_norm_refs=False. Before v0.7.1 the cached-latents fast path used
+    # the *raw* get_conditioning_latents defaults (gpt_cond_len=6,
+    # max_ref_length=30) while the tts_to_file fallback used XttsConfig's —
+    # so the two code paths conditioned the voice differently. Now both
+    # paths read these fields, so the voice identity no longer depends on
+    # which path happened to run.
+    gpt_cond_len: int = Field(
+        default=12,
+        ge=1,
+        le=60,
+        description=(
+            "Seconds of reference audio used to build the GPT (prosody/style) "
+            "conditioning latent. Longer captures more of the speaker's "
+            "delivery; upstream default is 12 s. Increase toward 30 s when "
+            "the reference corpus is clean and you want tighter style match."
+        ),
+    )
+    gpt_cond_chunk_len: int = Field(
+        default=4,
+        ge=1,
+        le=60,
+        description=(
+            "Chunk length (s) for GPT-latent averaging; must be <= "
+            "gpt_cond_len. Chunking improves stability (upstream default 4)."
+        ),
+    )
+    max_ref_len: int = Field(
+        default=10,
+        ge=3,
+        le=60,
+        description=(
+            "Maximum seconds taken from EACH reference WAV for the speaker "
+            "embedding (upstream XttsConfig default 10)."
+        ),
+    )
+    sound_norm_refs: bool = Field(
+        default=False,
+        description=(
+            "Normalize reference audio amplitude before conditioning. The "
+            "corpus phase already loudness-normalizes to target LUFS, so the "
+            "default stays False (matching upstream)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_conditioning_knobs(self) -> SynthesisConfig:
+        """Enforce upstream invariant: gpt_cond_chunk_len <= gpt_cond_len."""
+        if self.gpt_cond_chunk_len > self.gpt_cond_len:
+            raise ValueError(
+                f"gpt_cond_chunk_len ({self.gpt_cond_chunk_len}) must be <= "
+                f"gpt_cond_len ({self.gpt_cond_len}); upstream XTTS requires it."
+            )
+        return self
+
     cache_conditioning_latents: bool = Field(
         default=True,
         description=(

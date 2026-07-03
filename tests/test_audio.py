@@ -183,3 +183,113 @@ class TestP1AudioCleanup:
             ]
         )
         assert _estimate_snr_db(y) == _estimate_dynamic_range_db(y)
+
+
+# ─── Assembly primitives (Fase 3 long-form joins) ──────────────────
+class TestAssemblyPrimitives:
+    SR = 24000
+
+    def test_silence_duration(self) -> None:
+        from voicelegacy.audio import silence
+
+        assert len(silence(100.0, self.SR)) == 2400
+        assert len(silence(0.0, self.SR)) == 0
+        assert silence(50.0, self.SR).dtype == np.float32
+
+    def test_silence_negative_raises(self) -> None:
+        from voicelegacy.audio import silence
+
+        with pytest.raises(ValueError, match=">= 0"):
+            silence(-1.0, self.SR)
+
+    def test_crossfade_length_is_sum_minus_overlap(self) -> None:
+        from voicelegacy.audio import equal_power_crossfade
+
+        a = np.ones(1000, dtype=np.float32)
+        b = np.ones(800, dtype=np.float32)
+        fade_ms = 10.0
+        overlap = round(fade_ms / 1000.0 * self.SR)
+        out = equal_power_crossfade(a, b, self.SR, fade_ms)
+        assert len(out) == len(a) + len(b) - overlap
+
+    def test_equal_power_curve_bumps_for_identical_signals(self) -> None:
+        # For two identical constant signals, an EQUAL-POWER crossfade peaks at
+        # amp*sqrt(2) in the middle (a LINEAR crossfade would stay flat at amp).
+        # This is what proves the curve is equal-power, not linear.
+        from voicelegacy.audio import equal_power_crossfade
+
+        amp = 0.5
+        a = np.full(2000, amp, dtype=np.float32)
+        b = np.full(2000, amp, dtype=np.float32)
+        out = equal_power_crossfade(a, b, self.SR, 40.0)
+        overlap = round(40.0 / 1000.0 * self.SR)
+        midpoint = out[len(a) - overlap // 2]
+        assert midpoint == pytest.approx(amp * np.sqrt(2), abs=0.02)
+
+    def test_no_power_dip_on_uncorrelated_signals(self) -> None:
+        # The point of equal-power: joining two UNCORRELATED clips should not dip
+        # in power across the fade (a linear crossfade would dip ~3 dB).
+        from voicelegacy.audio import equal_power_crossfade
+
+        rng = np.random.default_rng(0)
+        a = rng.standard_normal(48000).astype(np.float32)
+        b = rng.standard_normal(48000).astype(np.float32)
+        out = equal_power_crossfade(a, b, self.SR, 200.0)
+        win = 480  # 20 ms windows
+        rms = np.array(
+            [np.sqrt(np.mean(out[i : i + win] ** 2)) for i in range(0, len(out) - win, win)]
+        )
+        # No window should fall far below the overall level (no big dip).
+        assert rms.min() > 0.80 * np.median(rms)
+
+    def test_crossfade_empty_or_short_falls_back_to_concat(self) -> None:
+        from voicelegacy.audio import equal_power_crossfade
+
+        a = np.ones(100, dtype=np.float32)
+        empty = np.asarray([], dtype=np.float32)
+        assert len(equal_power_crossfade(a, empty, self.SR, 10.0)) == 100
+        assert len(equal_power_crossfade(empty, a, self.SR, 10.0)) == 100
+
+    def test_concatenate_audio_ignores_empty(self) -> None:
+        from voicelegacy.audio import concatenate_audio
+
+        a = np.ones(10, dtype=np.float32)
+        empty = np.asarray([], dtype=np.float32)
+        assert len(concatenate_audio([a, empty, a])) == 20
+        assert len(concatenate_audio([empty, empty])) == 0
+
+
+# ─── Dynamic-range estimator regression (v0.7.1) ────────────────────
+class TestDynamicRangeEstimator:
+    """Guards the per-frame axis fix.
+
+    The previous implementation framed with librosa (axis=0 → shape
+    (n_frames, frame_length)) and then averaged over axis=0 — across
+    frames — so every real recording scored ~0 dB, the ``snr >= 15 dB``
+    quality gate rejected everything and conditional denoise always fired.
+    """
+
+    @staticmethod
+    def _speechlike(noise: float, sr: int = 22050, dur: float = 8.0) -> np.ndarray:
+        n = int(sr * dur)
+        t = np.arange(n) / sr
+        sig = 0.30 * np.sin(2 * np.pi * 220 * t)
+        sig = sig * (0.5 + 0.5 * np.sin(2 * np.pi * 3 * t))  # syllable envelope
+        rng = np.random.default_rng(seed=42)
+        return (sig + noise * rng.standard_normal(n)).astype(np.float32)
+
+    def test_clean_speechlike_clears_the_snr_gate(self) -> None:
+        from voicelegacy.audio import _estimate_dynamic_range_db
+        from voicelegacy.config import MIN_SNR_DB
+
+        dr = _estimate_dynamic_range_db(self._speechlike(noise=0.002))
+        assert dr > MIN_SNR_DB, (
+            f"clean speech-like signal scored {dr:.2f} dB — the axis bug is back"
+        )
+
+    def test_monotonic_with_noise_floor(self) -> None:
+        from voicelegacy.audio import _estimate_dynamic_range_db
+
+        clean = _estimate_dynamic_range_db(self._speechlike(noise=0.002))
+        noisy = _estimate_dynamic_range_db(self._speechlike(noise=0.05))
+        assert clean > noisy + 3.0  # clearly discriminates cleanliness

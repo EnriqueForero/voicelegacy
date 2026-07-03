@@ -28,6 +28,7 @@ import noisereduce as nr
 import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
+from numpy.lib.stride_tricks import sliding_window_view
 
 from voicelegacy.config import XTTS_INPUT_SR
 from voicelegacy.logging_config import get_logger
@@ -56,6 +57,7 @@ class AudioStats:
     rms_db: float
     peak_db: float
     snr_db: float
+    spectral_rolloff_hz: float = 0.0
 
 
 # ─── Loading ───────────────────────────────────────────────────────
@@ -144,6 +146,7 @@ def compute_stats(y: np.ndarray, sr: int, original_sr: int | None = None) -> Aud
     rms_db = 20.0 * np.log10(rms)
     peak_db = 20.0 * np.log10(peak)
     snr_db = _estimate_dynamic_range_db(y)
+    rolloff_hz = _spectral_rolloff_hz(y, sr)
 
     return AudioStats(
         duration_s=duration_s,
@@ -152,7 +155,30 @@ def compute_stats(y: np.ndarray, sr: int, original_sr: int | None = None) -> Aud
         rms_db=rms_db,
         peak_db=peak_db,
         snr_db=snr_db,
+        spectral_rolloff_hz=rolloff_hz,
     )
+
+
+def _spectral_rolloff_hz(y: np.ndarray, sr: int, roll_percent: float = 0.85) -> float:
+    """Estimate the frequency below which ``roll_percent`` of energy lives.
+
+    This measures the signal's *actual* usable bandwidth, unlike the container
+    sample rate. Telephone-band audio (~3.4 kHz) that was upsampled to 44.1 kHz
+    still has a low rolloff here, so a rolloff gate catches what the header gate
+    cannot. Returns the median rolloff across frames (0.0 for silence/too-short).
+    """
+    if y.size < 2048 or sr <= 0:
+        return 0.0
+    peak = float(np.max(np.abs(y)))
+    if peak <= 1e-9:
+        return 0.0
+    try:
+        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=roll_percent)
+    except Exception as exc:
+        logger.warning("Spectral rolloff failed ({}); reporting 0.", exc)
+        return 0.0
+    finite = rolloff[np.isfinite(rolloff)]
+    return float(np.median(finite)) if finite.size else 0.0
 
 
 def _estimate_dynamic_range_db(
@@ -177,9 +203,17 @@ def _estimate_dynamic_range_db(
     if len(y) < frame_length:
         return 0.0
 
-    # Frame-wise RMS energy
-    frames = librosa.util.frame(y, frame_length=frame_length, hop_length=hop_length, axis=0)
-    rms = np.sqrt(np.mean(frames**2, axis=0) + 1e-12)
+    # Frame-wise RMS energy. Framing is done with an explicit numpy sliding
+    # window instead of librosa.util.frame: with 1-D input and ``axis=0``,
+    # librosa >= 0.10 returns shape (n_frames, frame_length), so the previous
+    # ``np.mean(frames**2, axis=0)`` averaged ACROSS frames — collapsing 300+
+    # frames into 2048 near-identical per-position values. Top-10%/bottom-10%
+    # of those is ~1.0, i.e. ~0 dB for ANY real recording, which made the
+    # ``snr >= 15 dB`` gate reject every candidate and forced
+    # ``denoise_only_if_noisy`` to always denoise. The window view makes the
+    # sample axis unambiguous regardless of librosa version.
+    windows = sliding_window_view(y, frame_length)[::hop_length]
+    rms = np.sqrt(np.mean(windows.astype(np.float64) ** 2, axis=1) + 1e-12)
     rms_sorted = np.sort(rms)
 
     n = len(rms_sorted)
@@ -427,7 +461,124 @@ def slice_segment(
     return y[i0:i1]
 
 
+# ─── Assembly (long-form joins) ────────────────────────────────────
+def silence(duration_ms: float, sr: int) -> np.ndarray:
+    """Return mono float32 silence of ``duration_ms`` at ``sr`` (>= 0 ms)."""
+    if duration_ms < 0:
+        raise ValueError(f"duration_ms must be >= 0; got {duration_ms}")
+    return np.zeros(round(duration_ms / 1000.0 * sr), dtype=np.float32)
+
+
+def equal_power_crossfade(a: np.ndarray, b: np.ndarray, sr: int, fade_ms: float) -> np.ndarray:
+    """Join ``a`` and ``b`` with an equal-power crossfade of ``fade_ms``.
+
+    Equal-power (constant-power) uses cos/sin curves so the perceived loudness
+    stays constant across the fade. A naive linear crossfade dips about 3 dB at
+    the midpoint, which is audible as a little dip at every seam.
+
+    The fade length is clamped to the shorter clip. If either clip is empty or
+    ``fade_ms`` is non-positive, the clips are simply concatenated.
+
+    Args:
+        a: First mono clip (float32, [-1, 1]).
+        b: Second mono clip.
+        sr: Sample rate of both clips.
+        fade_ms: Crossfade duration in milliseconds.
+
+    Returns:
+        ``a`` and ``b`` joined; length is ``len(a) + len(b) - overlap``.
+    """
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    fade_len = round(fade_ms / 1000.0 * sr)
+    overlap = min(fade_len, len(a), len(b))
+    if overlap <= 0:
+        return np.concatenate([a, b]).astype(np.float32)
+
+    t = (np.arange(overlap, dtype=np.float32) + 0.5) / overlap
+    fade_out = np.cos(t * (np.pi / 2.0))
+    fade_in = np.sin(t * (np.pi / 2.0))
+    blended = a[-overlap:] * fade_out + b[:overlap] * fade_in
+    return np.concatenate([a[:-overlap], blended, b[overlap:]]).astype(np.float32)
+
+
+def concatenate_audio(parts: list[np.ndarray]) -> np.ndarray:
+    """Concatenate mono clips, ignoring empty ones. Empty input → empty array."""
+    pieces = [np.asarray(p, dtype=np.float32).reshape(-1) for p in parts if np.asarray(p).size]
+    if not pieces:
+        return np.asarray([], dtype=np.float32)
+    return np.concatenate(pieces).astype(np.float32)
+
+
 # ─── Pipeline shortcut ─────────────────────────────────────────────
+def clean_segment(
+    y: np.ndarray,
+    sr: int,
+    *,
+    apply_denoise: bool = True,
+    denoise_stationary: bool = False,
+    denoise_only_if_noisy: bool = False,
+    denoise_snr_threshold_db: float = 25.0,
+    apply_bandpass_filter: bool = False,
+    apply_preemphasis_filter: bool = False,
+    target_lufs: float = -23.0,
+    min_duration_s: float = 0.0,
+) -> np.ndarray:
+    """Canonical reference-segment cleaning chain — the single source of truth.
+
+    Order matters and is fixed here so it can never drift between callers:
+    denoise (optionally conditional) → band-pass → pre-emphasis → trim silence →
+    drop-if-too-short → loudness-normalize. Band-passing before denoise would
+    starve noisereduce of the bands it needs to model the noise floor, so denoise
+    runs first.
+
+    Conditional denoise: when ``denoise_only_if_noisy`` is True, denoise runs only
+    if the segment's estimated dynamic range is below ``denoise_snr_threshold_db``.
+    Denoising already-clean speech adds artifacts, so skipping it on clean clips is
+    safer.
+
+    Args:
+        y: Mono audio in [-1, 1].
+        sr: Sample rate of ``y``.
+        apply_denoise: Master switch for spectral denoising.
+        denoise_stationary: Use the stationary noise model instead of adaptive.
+        denoise_only_if_noisy: Gate denoise on measured dynamic range.
+        denoise_snr_threshold_db: Threshold consulted only when the gate is on.
+        apply_bandpass_filter: Apply the conservative speech band-pass.
+        apply_preemphasis_filter: Apply speech pre-emphasis.
+        target_lufs: Loudness target for the final normalization.
+        min_duration_s: If > 0 and the trimmed audio is shorter than this, return
+            an empty array (the caller treats that as "drop this segment").
+
+    Returns:
+        Cleaned, normalized mono audio — or an empty array if it fell below
+        ``min_duration_s`` after trimming.
+    """
+    if apply_denoise:
+        do_denoise = True
+        if denoise_only_if_noisy:
+            dynamic_range = _estimate_dynamic_range_db(y)
+            do_denoise = dynamic_range < denoise_snr_threshold_db
+            if not do_denoise:
+                logger.debug(
+                    "Skipping denoise: dynamic range {:.1f}dB >= threshold {:.1f}dB",
+                    dynamic_range,
+                    denoise_snr_threshold_db,
+                )
+        if do_denoise:
+            y = denoise(y, sr, stationary=denoise_stationary)
+    if apply_bandpass_filter:
+        y = apply_bandpass(y, sr)
+    if apply_preemphasis_filter:
+        y = apply_preemphasis(y)
+
+    y = trim_silence(y)
+    if min_duration_s > 0.0 and y.size < int(sr * min_duration_s):
+        return np.asarray([], dtype=np.float32)
+
+    return loudness_normalize(y, sr, target_lufs=target_lufs)
+
+
 def preprocess_full(
     path: Path,
     target_sr: int = XTTS_INPUT_SR,
@@ -456,14 +607,17 @@ def preprocess_full(
         Tuple of (clean_audio, stats_after_cleanup).
     """
     y, original_sr = load_audio_mono(path, target_sr=target_sr)
-    if apply_bandpass_filter:
-        y = apply_bandpass(y, target_sr)
-    if apply_preemphasis_filter:
-        y = apply_preemphasis(y)
-    if apply_denoise:
-        y = denoise(y, target_sr, stationary=denoise_stationary)
-    y = trim_silence(y)
-    y = loudness_normalize(y, target_sr, target_lufs=target_lufs)
+    # Delegate to the canonical chain so this one-shot path and the corpus
+    # extraction path can never use different cleaning logic or order.
+    y = clean_segment(
+        y,
+        target_sr,
+        apply_denoise=apply_denoise,
+        denoise_stationary=denoise_stationary,
+        apply_bandpass_filter=apply_bandpass_filter,
+        apply_preemphasis_filter=apply_preemphasis_filter,
+        target_lufs=target_lufs,
+    )
     # Use the ORIGINAL sample rate so quality gates can detect phone-codec
     # sources. compute_stats records sample_rate verbatim; downstream gates
     # (e.g. score_segment) check `stats.sample_rate < MIN_SAMPLING_RATE_HZ`.

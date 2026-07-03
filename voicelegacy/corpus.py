@@ -21,6 +21,8 @@ Anything else in the JSON is ignored.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,14 +30,10 @@ from pathlib import Path
 import numpy as np
 
 from voicelegacy.audio import (
-    apply_bandpass,
-    apply_preemphasis,
-    denoise,
+    clean_segment,
     load_audio_mono,
-    loudness_normalize,
     save_wav,
     slice_segment,
-    trim_silence,
 )
 from voicelegacy.config import XTTS_INPUT_SR, ReferenceConfig, WorkspacePaths
 from voicelegacy.logging_config import get_logger
@@ -367,6 +365,139 @@ def write_f0_outlier_report(
     logger.info("F0 outlier report → {}", report_path)
 
 
+# ─── Speaker-overlap (crosstalk) gate ──────────────────────────────
+@dataclass(frozen=True)
+class OverlapResult:
+    """How much a target segment is overlapped by other speakers.
+
+    Attributes:
+        segment: The target-speaker segment.
+        overlap_s: Seconds of this segment covered by other speakers (union, so
+            overlapping interlopers are not double-counted).
+        overlap_ratio: ``overlap_s / segment.duration_s``.
+        is_overlapping: Whether it exceeded the configured ratio and is dropped.
+    """
+
+    segment: SegmentRef
+    overlap_s: float
+    overlap_ratio: float
+    is_overlapping: bool
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize to a JSON-friendly dict for audit reports."""
+        return {
+            "source_audio": str(self.segment.source_audio),
+            "start_s": self.segment.start_s,
+            "end_s": self.segment.end_s,
+            "speaker": self.segment.speaker,
+            "duration_s": round(self.segment.duration_s, 3),
+            "overlap_s": round(self.overlap_s, 3),
+            "overlap_ratio": round(self.overlap_ratio, 4),
+            "is_overlapping": self.is_overlapping,
+        }
+
+
+def compute_overlap_seconds(target: SegmentRef, others: Iterable[SegmentRef]) -> float:
+    """Seconds of ``target`` covered by ``others`` (union of intersections).
+
+    Overlapping interlopers are merged before summing, so two other speakers
+    talking over the same instant count once, not twice.
+    """
+    start, end = target.start_s, target.end_s
+    if end <= start:
+        return 0.0
+    intervals: list[tuple[float, float]] = []
+    for other in others:
+        lo = max(start, other.start_s)
+        hi = min(end, other.end_s)
+        if hi > lo:
+            intervals.append((lo, hi))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    total = 0.0
+    cur_lo, cur_hi = intervals[0]
+    for lo, hi in intervals[1:]:
+        if lo > cur_hi:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+        else:
+            cur_hi = max(cur_hi, hi)
+    total += cur_hi - cur_lo
+    return total
+
+
+def analyze_overlap(
+    target_segments: list[SegmentRef],
+    all_segments: list[SegmentRef],
+    max_overlap_ratio: float,
+) -> list[OverlapResult]:
+    """Measure crosstalk for each target segment against other speakers.
+
+    Only segments from the SAME source audio and a DIFFERENT speaker count as
+    interlopers — overlap across different recordings is meaningless.
+    """
+    by_source: dict[Path, list[SegmentRef]] = defaultdict(list)
+    for seg in all_segments:
+        by_source[seg.source_audio].append(seg)
+
+    results: list[OverlapResult] = []
+    for target in target_segments:
+        others = [o for o in by_source.get(target.source_audio, []) if o.speaker != target.speaker]
+        overlap_s = compute_overlap_seconds(target, others)
+        ratio = overlap_s / target.duration_s if target.duration_s > 0 else 0.0
+        results.append(OverlapResult(target, overlap_s, ratio, ratio > max_overlap_ratio))
+    return results
+
+
+def filter_overlapping_segments(
+    target_segments: list[SegmentRef],
+    all_segments: list[SegmentRef],
+    config: ReferenceConfig,
+) -> list[SegmentRef]:
+    """Drop target segments whose crosstalk exceeds ``config.max_overlap_ratio``.
+
+    No-op unless ``config.enable_overlap_filter`` is set (opt-in, like the F0
+    filter), because it changes which references are selected.
+    """
+    if not config.enable_overlap_filter:
+        return target_segments
+    results = analyze_overlap(target_segments, all_segments, config.max_overlap_ratio)
+    rejected = [r for r in results if r.is_overlapping]
+    if rejected:
+        logger.warning(
+            "Overlap filter rejected {}/{} target-speaker segment(s) as crosstalk.",
+            len(rejected),
+            len(results),
+        )
+    else:
+        logger.info("Overlap filter found no crosstalk-contaminated segments.")
+    return [r.segment for r in results if not r.is_overlapping]
+
+
+def write_overlap_report(
+    report_path: Path,
+    results: list[OverlapResult],
+    config: ReferenceConfig,
+) -> None:
+    """Persist the crosstalk audit report for the reference phase."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    rejected = [r for r in results if r.is_overlapping]
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "enabled": config.enable_overlap_filter,
+        "summary": {
+            "total_segments_checked": len(results),
+            "rejected_as_crosstalk": len(rejected),
+            "max_overlap_ratio": config.max_overlap_ratio,
+        },
+        "rejected_segments": [r.to_dict() for r in rejected],
+        "all_segments": [r.to_dict() for r in results],
+    }
+    report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Overlap report → {}", report_path)
+
+
 # ─── Extraction ────────────────────────────────────────────────────
 def extract_segments_to_wav(
     segments: list[SegmentRef],
@@ -425,23 +556,24 @@ def extract_segments_to_wav(
             logger.warning("Bad segment bounds, skipping: {}", exc)
             continue
 
-        # Cleanup order matters: denoise FIRST so noisereduce estimates the
-        # noise profile from the full spectrum, THEN band-limit, THEN
-        # pre-emphasis. Band-passing before denoise would starve the noise
-        # estimator of the high/low bands it needs to model the noise floor.
-        if config.apply_denoise:
-            y_seg = denoise(y_seg, target_sr, stationary=config.denoise_stationary)
-        if config.apply_bandpass_filter:
-            y_seg = apply_bandpass(y_seg, target_sr)
-        if config.apply_preemphasis_filter:
-            y_seg = apply_preemphasis(y_seg)
-
-        y_seg = trim_silence(y_seg)
-        if y_seg.size < int(target_sr * 1.0):  # less than 1s after trim — drop
+        # Canonical cleaning chain (single source of truth in audio.clean_segment):
+        # denoise (optionally conditional on SNR) → band-pass → pre-emphasis →
+        # trim → drop-if-<1s → loudness-normalize.
+        y_seg = clean_segment(
+            y_seg,
+            target_sr,
+            apply_denoise=config.apply_denoise,
+            denoise_stationary=config.denoise_stationary,
+            denoise_only_if_noisy=config.denoise_only_if_noisy,
+            denoise_snr_threshold_db=config.denoise_snr_threshold_db,
+            apply_bandpass_filter=config.apply_bandpass_filter,
+            apply_preemphasis_filter=config.apply_preemphasis_filter,
+            target_lufs=config.target_loudness_lufs,
+            min_duration_s=1.0,
+        )
+        if y_seg.size == 0:  # fell below 1s after trimming
             logger.warning("Segment too short after trim, skipping (idx={})", idx)
             continue
-
-        y_seg = loudness_normalize(y_seg, target_sr, target_lufs=config.target_loudness_lufs)
 
         out_path = out_dir / f"{seg.source_audio.stem}_{idx:04d}_{seg.start_s:08.2f}.wav"
         save_wav(out_path, y_seg, target_sr)
@@ -491,6 +623,11 @@ def build_reference_corpus(
         min_duration_s=config.min_segment_duration_s,
         max_duration_s=config.max_segment_duration_s,
     )
+    if config.enable_overlap_filter:
+        overlap_results = analyze_overlap(filtered, all_segments, config.max_overlap_ratio)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        write_overlap_report(paths.reports / f"overlap_{ts}.json", overlap_results, config)
+        filtered = [r.segment for r in overlap_results if not r.is_overlapping]
     if config.enable_f0_outlier_filter:
         f0_results = analyze_f0_outliers(filtered, config)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

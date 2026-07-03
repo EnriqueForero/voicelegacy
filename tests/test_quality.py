@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
 from voicelegacy.audio import AudioStats
 from voicelegacy.quality import evaluate_file, rank_candidates, score_segment
@@ -223,3 +224,95 @@ class TestPhoneCodecGateEndToEnd:
         report = evaluate_file(wav_path, min_snr_db=0.0)
         assert report.stats.sample_rate == 16000
         assert not any("phone-codec" in r or "sample_rate" in r for r in report.reasons)
+
+
+# ─── select_reference_wavs (v0.7.1) ─────────────────────────────────
+class TestSelectReferenceWavs:
+    """Quality-ranked reference selection for synthesis-time conditioning."""
+
+    @staticmethod
+    def _speechlike_wav(path: Path, sr: int, duration_s: float, noise: float) -> Path:
+        """Harmonic mix + syllable envelope + noise floor (controls SNR)."""
+        n = int(sr * duration_s)
+        t = np.arange(n) / sr
+        sig = (
+            0.30 * np.sin(2 * np.pi * 220 * t)
+            + 0.15 * np.sin(2 * np.pi * 440 * t)
+            + 0.07 * np.sin(2 * np.pi * 880 * t)
+        )
+        sig *= 0.5 + 0.5 * np.sin(2 * np.pi * 3 * t)
+        rng = np.random.default_rng(seed=42)
+        sig = sig + noise * rng.standard_normal(n)
+        sf.write(str(path), sig.astype(np.float32), sr, subtype="PCM_16")
+        return path
+
+    def test_ranks_best_snr_first_and_caps_at_top_n(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        # Alphabetical order is deliberately the INVERSE of quality order:
+        # a_ruidoso has the worst SNR, z_limpio the best. The old glob-based
+        # selection would have put the noisy one first.
+        self._speechlike_wav(corpus / "a_ruidoso.wav", 22050, 8.0, noise=0.02)
+        self._speechlike_wav(corpus / "m_medio.wav", 22050, 8.0, noise=0.008)
+        self._speechlike_wav(corpus / "z_limpio.wav", 22050, 8.0, noise=0.002)
+
+        selected = select_reference_wavs(corpus, top_n=2)
+
+        assert len(selected) == 2
+        assert selected[0].name == "z_limpio.wav"  # best first → leads gpt_cond
+        assert "a_ruidoso.wav" not in {p.name for p in selected}
+
+    def test_top_n_zero_is_legacy_alphabetical_all(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        self._speechlike_wav(corpus / "b.wav", 22050, 8.0, noise=0.02)
+        self._speechlike_wav(corpus / "a.wav", 22050, 8.0, noise=0.002)
+
+        selected = select_reference_wavs(corpus, top_n=0)
+
+        assert [p.name for p in selected] == ["a.wav", "b.wav"]
+
+    def test_nothing_passing_falls_back_to_all_loadable(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        # Both under the 6 s duration gate → ranking is empty → fail-open.
+        self._speechlike_wav(corpus / "corto1.wav", 22050, 1.0, noise=0.002)
+        self._speechlike_wav(corpus / "corto2.wav", 22050, 1.0, noise=0.002)
+
+        selected = select_reference_wavs(corpus, top_n=5)
+
+        assert len(selected) == 2
+
+    def test_unreadable_wavs_are_excluded_everywhere(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "basura.wav").write_bytes(b"not a wav at all")
+        self._speechlike_wav(corpus / "bueno.wav", 22050, 8.0, noise=0.002)
+
+        selected = select_reference_wavs(corpus, top_n=5)
+
+        assert [p.name for p in selected] == ["bueno.wav"]
+
+    def test_all_unreadable_returns_empty(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "basura.wav").write_bytes(b"nope")
+
+        assert select_reference_wavs(corpus, top_n=5) == []
+
+    def test_empty_dir_returns_empty(self, tmp_path: Path) -> None:
+        from voicelegacy.quality import select_reference_wavs
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        assert select_reference_wavs(corpus) == []

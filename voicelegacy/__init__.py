@@ -31,6 +31,12 @@ from voicelegacy.config import (
     SynthesisConfig,
     WorkspacePaths,
 )
+from voicelegacy.evaluation import (
+    BenchmarkConfig,
+    BenchmarkReport,
+    load_golden_texts,
+    run_benchmark,
+)
 from voicelegacy.finetune_dataset import (
     CoherenceResult,
     DatasetBuildResult,
@@ -44,6 +50,12 @@ from voicelegacy.finetuned_inference import (
     synthesize_with_finetuned,
 )
 from voicelegacy.logging_config import configure_logging, get_logger
+from voicelegacy.longform import (
+    LongFormConfig,
+    LongFormResult,
+    LongFormSynthesizer,
+    segment_text,
+)
 from voicelegacy.pipeline import (
     CorpusBuildResult,
     SynthesisResult,
@@ -55,7 +67,7 @@ from voicelegacy.quality import QualityReport, evaluate_file, rank_candidates
 from voicelegacy.similarity import SimilarityReport, compute_similarity
 from voicelegacy.synthesis import load_xtts_model, release_model
 
-__version__ = "0.4.0"
+__version__ = "0.7.1"
 
 __all__ = [
     "MAX_REF_DURATION_S",
@@ -65,10 +77,15 @@ __all__ = [
     "MIN_USABLE_REFERENCE_SEGMENTS",
     "XTTS_INPUT_SR",
     "XTTS_OUTPUT_SR",
+    "BenchmarkConfig",
+    "BenchmarkReport",
     "CoherenceResult",
     "CorpusBuildResult",
     "DatasetBuildResult",
     "FineTunedCheckpoint",
+    "LongFormConfig",
+    "LongFormResult",
+    "LongFormSynthesizer",
     "PipelineConfig",
     "QualityReport",
     "ReferenceConfig",
@@ -82,13 +99,16 @@ __all__ = [
     "evaluate_file",
     "get_logger",
     "load_finetuned_model",
+    "load_golden_texts",
     "load_xtts_model",
     "rank_candidates",
     "release_finetuned_model",
     "release_model",
     "run_batch_synthesis",
+    "run_benchmark",
     "run_reference_phase",
     "run_synthesis",
+    "segment_text",
     "synthesize_with_finetuned",
     "validate_corpus_coherence",
 ]

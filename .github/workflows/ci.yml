@@ -30,6 +30,13 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
+      # Fail fast on a broken pyproject BEFORE any install attempt. A malformed
+      # TOML makes `pip install -e` crash with a confusing TOMLDecodeError; this
+      # gives a clear signal first. (Was previously placed AFTER the install,
+      # where it could never run because the install had already failed.)
+      - name: Validate pyproject.toml parses
+        run: python scripts/check_pyproject_toml.py pyproject.toml
+
       - name: Install CPU-only torch for lightweight test imports
         run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
@@ -38,10 +45,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Validate pyproject.toml parses
-        run: python -c "import tomllib; tomllib.load(open('pyproject.toml','rb'))"
+      # Run every pre-commit hook in CI so the local guards (pyproject TOML
+      # validity, notebook schema, no live runtime.unassign()) are actually
+      # enforced and not merely declared. This is the single source of truth
+      # for lint + format (ruff-check / ruff-format) — no duplicated ruff steps.
+      - name: Run pre-commit hooks
+        run: pre-commit run --all-files --show-diff-on-failure
 
-      - name: Validate all generated notebooks
+      # The generators are the source of truth for the notebooks; regenerate
+      # them and re-validate the fresh output (pre-commit only checks the
+      # committed copies, it does not run the build_*.py generators).
+      - name: Regenerate and validate notebooks
         run: |
           for gen in notebooks/build_notebook.py \
                      notebooks/build_finetune_notebook.py \
@@ -54,12 +68,6 @@ jobs:
             python scripts/check_notebook_schema.py "$nb"
             python scripts/check_no_runtime_unassign.py "$nb"
           done
-
-      - name: Check formatting
-        run: python -m ruff format --check .
-
-      - name: Lint
-        run: python -m ruff check .
 
       - name: Test with coverage
         run: python -m pytest -q

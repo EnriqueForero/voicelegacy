@@ -200,7 +200,8 @@ print(f"Idioma    : {LANGUAGE}  |  Monólogo: {ES_MONOLOGO}")"""
 """
     ),
     _code(
-        """!pip install -q coqui-tts==0.27.5 faster-whisper==1.1.0 voicelegacy=={version}
+        """# voicelegacy no está en PyPI: se instala desde el tag de GitHub.
+!pip install -q coqui-tts==0.27.5 faster-whisper==1.1.0 git+https://github.com/EnriqueForero/voicelegacy.git@v{version}
 
 import importlib
 for mod in ("TTS.tts.models.xtts", "faster_whisper",

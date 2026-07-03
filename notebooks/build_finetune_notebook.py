@@ -207,7 +207,8 @@ celda corre sin error, todo está bien.
     ),
     _code(
         """# Coqui TTS (versión validada con voicelegacy 0.3.0)
-!pip install -q coqui-tts==0.27.5 voicelegacy=={version}
+# voicelegacy no está en PyPI: se instala desde el tag de GitHub.
+!pip install -q coqui-tts==0.27.5 git+https://github.com/EnriqueForero/voicelegacy.git@v{version}
 
 # Verificar imports críticos
 import importlib

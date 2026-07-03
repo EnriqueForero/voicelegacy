@@ -6,10 +6,352 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-07-02 — fidelidad de clonación: selección top-N real, re-rolls con entropía y condicionamiento unificado
+
+PATCH de corrección: tres defectos que degradaban silenciosamente la calidad
+de la voz clonada, hallados en auditoría de código. Ningún cambio de API
+rompe compatibilidad; `LongFormSynthesizer` gana un flag opcional.
+
+### Fixed
+- **`synthesize` / `synthesize-long` ahora usan las top-N referencias por
+  calidad, no el directorio entero en orden alfabético.** `run_reference_phase`
+  escribe TODOS los segmentos filtrados a `reference_corpus/` y su ranking
+  top-N vivía solo en el reporte JSON; los comandos de síntesis globeaban el
+  directorio, de modo que (a) segmentos que FALLARON la compuerta de SNR/clipping
+  entraban al condicionamiento y (b) el latente GPT de XTTS — calculado sobre los
+  primeros `gpt_cond_len` segundos — quedaba dominado por lo que ordenara primero
+  alfabéticamente (= cronológico), no por lo mejor. Nuevo helper
+  `quality.select_reference_wavs` re-puntúa el directorio en síntesis (barato:
+  solo estadísticas, sin GPU) y devuelve el top-N mejor-primero. Nueva opción
+  `--top-n` en ambos comandos (default: `ReferenceConfig.top_n_segments` = 5;
+  `0` = comportamiento legado explícito). Archivos ilegibles se excluyen con
+  warning en vez de tumbar la corrida; si nada pasa las compuertas, fail-open
+  a todos los decodificables con warning fuerte.
+- **Los reintentos de `synthesize-long` ahora re-tiran dados de verdad.**
+  `synthesize_to_file` re-sembraba el RNG a `SynthesisConfig.seed` (default 42)
+  antes de CADA inferencia, así que cada re-roll reproducía el MISMO audio
+  fallido: el presupuesto `max_retries` quemaba GPU sin poder corregir nada.
+  El closure del CLI deriva ahora `seed = base + attempt` (helper puro
+  `cli._config_for_attempt`), reproducible: el sidecar ya registra `retries`,
+  así que `base_seed + retries` recrea el audio publicado byte a byte.
+  `LongFormSynthesizer` acepta `synthesize_accepts_attempt=True` (opt-in
+  explícito; default False mantiene compatibilidad con callables `(text)`).
+- **Ambas rutas de inferencia condicionan la voz igual.** La ruta rápida con
+  caché de latentes llamaba `get_conditioning_latents` con los defaults crudos
+  (`gpt_cond_len=6`, `max_ref_length=30`) mientras el fallback `tts_to_file`
+  usaba los de `XttsConfig` (12/10): mismo corpus, dos voces distintas según
+  qué ruta corriera. `SynthesisConfig` expone ahora `gpt_cond_len` (12),
+  `gpt_cond_chunk_len` (4), `max_ref_len` (10) y `sound_norm_refs` (False) —
+  defaults espejo del upstream idiap — y ambas rutas los leen. La clave del
+  caché de latentes incluye los knobs (antes, cambiar `gpt_cond_len` habría
+  servido latentes rancios). Validador: `gpt_cond_chunk_len <= gpt_cond_len`
+  (invariante upstream).
+
+- **El estimador de rango dinámico (“SNR”) medía ~0 dB para cualquier audio
+  real.** `librosa.util.frame(y, ..., axis=0)` con entrada 1-D devuelve
+  `(n_frames, frame_length)` y el código promediaba sobre `axis=0` — a través
+  de los frames — colapsando 300+ frames en 2048 valores casi idénticos:
+  top-10%/bottom-10% ≈ 1 → ~0.1 dB medido en señal limpia tipo voz. Efecto en
+  cascada: la compuerta `snr >= 15 dB` de `evaluate_file` rechazaba TODOS los
+  candidatos reales (ranking vacío, `run_batch_synthesis` abortaba por
+  `MIN_USABLE_REFERENCE_SEGMENTS`) y `denoise_only_if_noisy` denoiseaba
+  SIEMPRE (0 < umbral), introduciendo artefactos en cada segmento del corpus.
+  Reemplazado el framing por `numpy.lib.stride_tricks.sliding_window_view`
+  (eje de muestras inequívoco) con RMS por frame en float64. Medición
+  post-fix: señal limpia tipo voz ≈ 19.8 dB, ruidosa (noise=0.02) ≈ 16.9 dB —
+  monotónico y discriminante. Tests de regresión anti-eje añadidos.
+
+### Notes
+- Los hashes de idempotencia de `run_batch_synthesis` incorporan los campos
+  nuevos vía `model_dump_json()`: outputs cacheados de 0.7.0 se re-sintetizan
+  una vez tras actualizar (esperado y correcto: el condicionamiento cambió).
+- 16 tests nuevos cubren selección/ranking/fail-open/archivos corruptos,
+  forwarding de `attempt`, derivación de seed y knobs en ambas rutas.
+
+## [0.7.0] — 2026-06-11 — Fase 3 · síntesis de audio largo (LongFormSynthesizer)
+
+Salto MINOR (0.6.0 → 0.7.0): API pública nueva, el objetivo declarado del proyecto.
+XTTS-v2 se descarrila pasados ~250–270 caracteres por generación (trunca/alucina),
+que es lo que el baseline expone como WER alto en los estímulos `long`/`chapter`.
+El `LongFormSynthesizer` orquesta muchas síntesis cortas en un audio continuo **y
+detecta/corrige los fallos** en vez de confiar en que no ocurran. Toda la lógica
+(chunking, ensamblado, verificación, caché, orquestación) es testeable **sin GPU**
+porque la síntesis se inyecta; los números finales de fidelidad los produce el
+usuario corriendo `benchmark` antes/después en una T4.
+
+### Fase 3 — pasos del plan
+
+- **Paso 2 (chunker de texto) — completado.** Nuevo módulo `voicelegacy.longform`
+  con `segment_text` y `Chunk`. Segmenta texto largo en trozos sintetizables por
+  XTTS (que se descarrila pasados ~250–270 caracteres) respetando jerarquía
+  oración → cláusula → espacio, **sin exceder el presupuesto** y **sin partir
+  palabras**. Maneja las trampas del español: abreviaturas honoríficas/de medida
+  cuyo punto no es fin de oración (`Sr.`, `Dra.`, `núm.`), decimales/miles
+  (`3,5` / `1.000`), horas y rangos (`14:30`, `5–7`), signos de apertura
+  (`¿ ¡`), puntos suspensivos y comillas de cierre. Cada trozo etiqueta la
+  frontera que lo sigue (paragraph/sentence/clause/hard/end) para que el
+  ensamblador (paso 3) elija pausa o crossfade. 31 tests, módulo al 94% de
+  cobertura. Verificado sobre el "capítulo" real del golden set (4.366 chars →
+  33 trozos, máx. 215 chars, 805 palabras preservadas en orden exacto).
+  - Aún NO se expone en el `__init__` público ni se sube de versión: es una
+    pieza interna del LongFormSynthesizer que se completa en los pasos 3–8
+    (ensamblador de audio, verificación ASR + reintentos, checkpoint/resume,
+    orquestador, comando CLI). El bump a 0.7.0 ocurre al cerrar la fase.
+
+- **Paso 3 (ensamblador de audio) — completado.** Primitivas DSP reutilizables
+  en `audio.py`: `equal_power_crossfade` (crossfade de potencia constante —
+  cos/sin— para que no haya caída de ~3 dB en cada costura, a diferencia del
+  lineal), `silence` y `concatenate_audio`. Y `longform.assemble_chunks`, que
+  une los trozos según la frontera de cada uno: `hard` → crossfade (corte
+  forzado a mitad de cláusula, sin pausa real); `clause`/`sentence`/`paragraph`
+  → silencio creciente; recorta el silencio de cada trozo antes de unir para
+  que las pausas sean deterministas. 16 tests (incluida la verificación de que
+  el equal-power no hunde la potencia en material no correlacionado).
+- **Paso 4 (compuerta ASR `verify_chunk`) — completado.** Transcribe cada trozo
+  renderizado con faster-whisper y mide WER contra el texto pedido, **reutilizando
+  el ASR y el WER del harness (sin duplicar código)**. Es el detector barato del
+  modo de fallo dominante en texto largo (truncamiento/alucinación). Degrada con
+  seguridad: si falta faster-whisper, `status="skipped"` con `passed=True` (no se
+  puede verificar → no se bloquea); un error de ASR es `status="error"` con
+  `passed=True` (un fallo del ASR no debe descartar audio bueno). El bucle de
+  reintento que la consume vive en el orquestador (paso 6). 5 tests.
+  - `voicelegacy.longform` va al 95% de cobertura; total de tests 361.
+
+- **Paso 5 (checkpoint / resume) — completado.** `LongFormCache` + `compute_doc_hash`
+  en `voicelegacy.longform`. Caché por trozo en disco
+  (`<cache_root>/<doc_hash>/chunk_NNNN.wav` + `manifest.json`) para que un capítulo
+  pueda **reanudarse** si Colab se desconecta (límite de 12 h): el orquestador
+  consulta `has_chunk(i)` y solo sintetiza los trozos faltantes. El directorio
+  ES el hash de (texto + config), así que **cambiar el texto o la config invalida
+  la caché automáticamente** (no se reusa audio rancio). Guarda la verificación
+  ASR y el conteo de reintentos por trozo; tolera un manifiesto corrupto
+  (empieza de cero sin reventar). 10 tests, incluida la simulación de reinicio
+  (nueva instancia sobre el mismo directorio ve los trozos hechos). Total: 371 tests.
+
+- **Paso 6 (orquestador `LongFormSynthesizer`) — completado.** El corazón de la
+  fase: ata chunker + verify + caché + ensamblador con la **síntesis inyectada**
+  (corre con XTTS real o con mock; testeable sin GPU). Incluye el **bucle de
+  reintento**: cada trozo se verifica con ASR y, si falla (el modo dominante de
+  XTTS en texto largo es el truncamiento silencioso), se **re-sintetiza** hasta
+  `max_retries` veces — XTTS es estocástico, re-tirar el dado suele arreglarlo.
+  Si todos los intentos fallan, **conserva el de menor WER y marca el trozo en el
+  sidecar** para revisión humana: los fallos se vuelven visibles y raros en vez de
+  silenciosos. Usa `LongFormCache` para reanudar y escribe un sidecar de auditoría
+  (`<salida>.sidecar.json`) con WER por trozo, reintentos, trozos marcados, RTF y
+  VRAM. Nuevas clases: `LongFormConfig` (dataclass con validación; su
+  `cache_config()` excluye pausas/crossfade porque solo afectan el ensamblado,
+  no el audio cacheado), `RenderedChunk`, `LongFormResult`, `LongFormSynthesizer`.
+  Confirmado el paso 1: `synthesis.py` **ya cachea los latentes de condicionamiento**
+  (`_get_conditioning_latents_cached`), lo que habilitará reusar la voz una sola
+  vez en el comando CLI sin que derive entre trozos. 18 tests (render end-to-end
+  con mock, reintento-luego-pasa, todos-fallan-marca-y-conserva-mejor, resume,
+  force, invalidación por cambio de texto). `longform.py` al 96% de cobertura;
+  total: 389 tests.
+
+  Decisión de alcance honesta: el **re-troceo** de un trozo que falla persistentemente
+  (mencionado en el plan) NO se implementó en este v1. Razón: re-trocear a mitad de
+  render rompe el modelo de índices de la caché, y el reintento ya cubre la mayoría
+  de los casos (la estocasticidad de XTTS). Entregar re-troceo a medias sería deuda;
+  el comportamiento actual (reintento + marcar lo irrecuperable) es completo y honesto.
+  El re-troceo queda como refinamiento futuro documentado.
+
+- **Paso 7 (comando CLI `synthesize-long`) — completado.** Sintetiza texto largo
+  (inline `--text` o archivo `--text-file`) a un WAV continuo. Construye el callable
+  real envolviendo `synthesize_to_file`, que **reutiliza los latentes de
+  condicionamiento cacheados** entre trozos (la voz no deriva). Flags:
+  `--max-chunk-chars`, `--max-wer`, `--max-retries`, `--no-asr-verify`,
+  `--resume/--no-resume`, `--force`, `--accept-tos`. Imprime una tabla resumen
+  (duración, trozos, desde caché, WER medio, marcados, RTF) y avisa de los trozos
+  marcados. 6 tests con `CliRunner` y modelo mockeado (end-to-end → WAV + sidecar).
+
+### Added (API pública de Fase 3)
+
+- `voicelegacy.LongFormSynthesizer`, `LongFormConfig`, `LongFormResult` y
+  `segment_text` exportados desde el paquete raíz.
+- Comando `voicelegacy synthesize-long`.
+- `docs/P3_LONGFORM.md` (especificación de diseño) y sección en el README.
+
+### Verified
+
+- **395 tests verdes**, `voicelegacy.longform` al ~96% de cobertura, total ≥80%.
+- `ruff`/`pre-commit` limpios; `build`+`twine` PASSED; `LongFormSynthesizer` y el
+  comando importables/funcionales desde el wheel instalado (render → WAV + sidecar).
+- Confirmado el paso 1: `synthesis.py` ya cachea los latentes de condicionamiento
+  (`_CONDITIONING_LATENTS_CACHE`), reutilizados entre trozos para consistencia de voz.
+
+### Cierre de Fase 3 — lo que el usuario debe correr en T4
+
+El criterio de éxito (WER bajo en `long`/`chapter`) se **demuestra**, no se asume:
+sintetice esos estímulos con `synthesize-long` y re-corra `benchmark` para comparar
+contra el baseline congelado. La librería entrega el código + tests con mock; el
+número final requiere GPU + el corpus real. Ver `docs/P3_LONGFORM.md` §validación.
+
 - P3-27 (tabla SNR fuente → similarity esperada): experimento empírico con audio real pendiente. Bloqueante para v1.0; no bloqueante para v0.3.0 que aporta valor de ingeniería independiente.
 - P3-31 (Polars/DuckDB): no aplica al volumen actual (1-3 entrevistas).
 
-## [0.4.0] — 2026-05-24 — Turno 14 · correcciones de auditoría (bug crítico, coherencia, defaults)
+## [0.6.0] — 2026-06-11 — Fase 2 · precisión del corpus de referencia (sin cambiar defaults)
+
+Salto MINOR (0.5.0 → 0.6.0): API aditiva. Atiende el tercer bloque del plan —
+precisión del corpus. Todas las palancas nuevas son **opt-in con default igual al
+comportamiento actual**: cambiar un default de selección es un cambio de precisión
+que la regla de oro exige medir con el harness primero. Aquí se entregan las
+herramientas (tested), no un cambio de comportamiento silencioso.
+
+### Added
+
+- **`audio.clean_segment`** — cadena de limpieza **canónica única** (DRY). Antes
+  había dos cadenas con órdenes distintos: la inline de `corpus.extract_segments_to_wav`
+  (denoise→bandpass→preemphasis, la correcta) y `audio.preprocess_full`
+  (bandpass→preemphasis→denoise, la vieja). Ahora ambas delegan en `clean_segment`,
+  así que no pueden volver a divergir. Orden fijo: denoise (opcionalmente condicional)
+  → band-pass → pre-emphasis → trim → drop-si-<min → loudness-normalize.
+- **Denoise condicional por SNR** (`ReferenceConfig.denoise_only_if_noisy` +
+  `denoise_snr_threshold_db`): cuando se activa, solo denoisa segmentos cuyo rango
+  dinámico estimado cae bajo el umbral. Denoisar audio ya limpio mete artefactos.
+  Default off → denoise incondicional como antes.
+- **Compuerta de banda por rolloff espectral** (`ReferenceConfig.min_spectral_rolloff_hz`,
+  default 0 = desactivada): `AudioStats` ahora incluye `spectral_rolloff_hz` (mediana
+  del rolloff 85%%), y `quality.score_segment` puede rechazar audio de banda angosta.
+  **Corrige un bug real:** la compuerta anti-telefónico solo miraba el sample-rate del
+  header, que NO detecta audio de banda telefónica (~3,4 kHz) **re-muestreado** a 22/44 kHz
+  — ese audio pasaba con `sample_rate=44100`. El rolloff se mide de la señal y lo caza.
+- **Compuerta de solapamiento de hablantes** (crosstalk) en `corpus`
+  (`ReferenceConfig.enable_overlap_filter` + `max_overlap_ratio`, default off, mismo
+  patrón que el filtro F0): `compute_overlap_seconds`, `analyze_overlap`,
+  `filter_overlapping_segments`, `OverlapResult`, `write_overlap_report`. Rechaza
+  segmentos del hablante objetivo solapados con otros hablantes (mismo audio fuente)
+  por encima del ratio; el solapamiento se calcula como unión de intervalos (no
+  doble-cuenta a dos interlocutores simultáneos). Escribe `reports/overlap_<ts>.json`.
+- **20 tests nuevos** (`test_precision_gates.py` + seam update en `test_corpus.py`):
+  rolloff narrowband vs wideband, el caso teléfono-re-muestreado que pasa el gate de
+  sample-rate pero falla el de rolloff, denoise condicional (skip en limpio / corre en
+  ruidoso), drop por duración, y la matemática de overlap (parcial, contención, merge
+  de múltiples, distinto hablante/fuente no cuenta). Total: 309 tests.
+
+### Changed
+
+- `corpus.extract_segments_to_wav` y `audio.preprocess_full` ahora usan
+  `clean_segment` (refactor interno; el orden de `preprocess_full` se corrige al
+  canónico, sin efecto con sus defaults porque band-pass/pre-emphasis están off).
+- `QualityReport.to_dict` ahora incluye `spectral_rolloff_hz`.
+
+### Deferred (con motivo, no por descuido)
+
+- **Score de selección perceptual** y **VAD Silero**: el score de selección es una
+  palanca de tuning pura; re-ponderarlo sin un número del harness viola la regla de oro.
+  Silero VAD es una dependencia opcional pesada de menor prioridad. Ambos se abordan
+  después de que exista el baseline para poder medir su efecto. Las correcciones de esta
+  fase (rolloff, overlap, DRY) son de exactitud, no de tuning, por eso sí entran ahora.
+
+### Verified
+
+- 309 tests verdes, cobertura 85,1%. `ruff`/`pre-commit` limpios. `build`+`twine` PASSED.
+- Refactor confirmado no-rompiente: los 289 tests previos siguen verdes (un test que
+  parcheaba un detalle de implementación —`corpus.trim_silence`— se actualizó al nuevo
+  seam `audio.trim_silence`, mismo comportamiento verificado).
+
+
+
+Salto MINOR (0.4.1 → 0.5.0): API pública nueva. Atiende el segundo hallazgo
+estructural de la auditoría — "las compuertas de calidad medían la entrada, nada
+medía la salida". Convierte el juicio subjetivo ("¿suena como ella?") en números
+reproducibles. **Regla de oro establecida:** ninguna mejora de precisión se
+mergea sin un número de este harness.
+
+### Added
+
+- **Módulo `voicelegacy.evaluation`** — harness de evaluación. La síntesis se
+  **inyecta** como callable ``(texto) -> (waveform, sample_rate)``: corre con el
+  XTTS real en T4 o con un mock en los tests, sin que el módulo importe coqui-tts.
+  Métricas (todas opcionales, degradan a ``skipped`` si falta su dependencia, igual
+  que `similarity`):
+  - **SECS (similitud de hablante)** con **ECAPA-TDNN** (SpeechBrain), el estándar
+    de los papers de TTS. Resemblyzer se mantiene como segunda opinión barata.
+    Aviso documentado: ECAPA y Resemblyzer viven en **escalas distintas**; las
+    bandas 0,60/0,75/0,85 de Resemblyzer NO se transfieren a ECAPA.
+  - **WER/CER round-trip**: transcribe la salida con **faster-whisper** y la compara
+    contra el texto pedido. Único detector barato del modo de fallo dominante en
+    texto largo: truncamiento/alucinación/palabras comidas. El cálculo de WER/CER
+    (distancia de edición) se implementó aquí, **sin dependencias nuevas**; solo el
+    ASR necesita faster-whisper.
+  - **MOS proxy** vía **TorchAudio-SQUIM** objetivo (PESQ/STOI/SI-SDR, sin referencia
+    limpia). Proxy consistente, no verdad absoluta.
+  - **RTF** (segundos de cómputo / segundos de audio) y **VRAM pico**, vía `telemetry`.
+- **Comando `voicelegacy benchmark`** — sintetiza cada estímulo con el modelo y el
+  corpus reales, puntúa fidelidad y velocidad, escribe `reports/benchmark_<run>.json`
+  y acumula `reports/benchmarks.parquet` (con fallback a JSONL si no hay pandas).
+  Persiste el audio sintetizado para auditoría. Flags `--no-ecapa/--no-resemblyzer/
+  --no-wer/--no-mos`, `--texts`, `--limit`.
+- **Golden set versionado** `voicelegacy/data/golden_texts_es.txt` — sustrato de
+  medición congelado: 30 frases cortas, 10 medias (~200 chars, al límite de XTTS),
+  5 párrafos largos y 1 "capítulo" (~4.4k chars, prueba de estrés de audiolibro).
+  Contenido es-CO con números, fechas, siglas (DIAN, DANE, ICA, SENA, EPS) y nombres
+  propios colombianos — donde XTTS tropieza. Se empaqueta como package-data para que
+  el comando lo encuentre en el wheel instalado.
+- **API pública**: `BenchmarkConfig`, `BenchmarkReport`, `run_benchmark`,
+  `load_golden_texts` exportados desde `voicelegacy`.
+- **Extra `eval`** (`pip install "voicelegacy[eval] @ git+..."`): speechbrain,
+  torchaudio, faster-whisper, num2words, pandas, pyarrow. Floors provisionales,
+  a pinar tras validar en la imagen T4. Incluido en `all`.
+- **80 tests nuevos** (`test_evaluation.py`, `test_packaging.py` ampliado, comando
+  benchmark en `test_cli.py`): orquestación end-to-end con síntesis mock, WER/CER,
+  normalizador es, escritura de reporte, agregación, acumulación parquet/JSONL, y el
+  skip de cada métrica sin su dependencia. Total: 286 tests.
+
+### Honest limitation (lo que este entorno NO puede entregar)
+
+- **El baseline empírico no está incluido.** Congelar el "antes" (XTTS zero-shot +
+  corpus real) exige GPU T4 + pesos de XTTS + el corpus del usuario, ausentes aquí.
+  El harness y sus tests con mock están completos y verdes; los números reales
+  (SECS/WER/MOS del baseline) los produce el usuario corriendo `voicelegacy benchmark`
+  en Colab. "Listo-para-producción-como-código" ≠ "baseline-validado". El criterio de
+  aceptación de Fase 1 (tabla baseline en el README) se cierra cuando el usuario corre
+  ese comando en T4.
+
+### Verified
+
+- 286 tests verdes, cobertura **83,4%** (piso 80%). Lo no cubierto en `evaluation.py`
+  son los cuerpos de inferencia de modelos (ECAPA/ASR/SQUIM), no ejecutables sin GPU
+  ni pesos — se validan en T4, no en CI.
+- `ruff check`/`format` limpios; `pre-commit run --all-files` verde.
+- Comando `benchmark` probado end-to-end con el modelo XTTS mockeado (escribe reporte,
+  agrega, imprime tabla).
+
+
+
+Salto PATCH (0.4.0 → 0.4.1): no cambia la API pública ni el comportamiento de la
+librería. Repara que un tercero **no podía instalar ni usar** el paquete y endurece
+las compuertas de CI para que las regresiones de empaquetado no vuelvan en silencio.
+
+### Fixed
+
+- **P0-1 — `pyproject.toml` inválido (bloqueante absoluto).** `[tool.setuptools.packages.find]` tenía `where = [".]` (comilla sin cerrar, línea 54) → `pip install -e .` reventaba con `TOMLDecodeError: Illegal character '\n' (line 54)`. Corregido a `where = ["."]`. **Causa raíz:** ningún generador regenera el archivo (se verificó); fue una regresión manual que el hook `scripts/check_pyproject_toml.py` habría atrapado, pero el hook nunca corría porque no estaba cableado al CI (ver más abajo).
+- **P0-6 — el CI validaba el `pyproject.toml` *después* de `pip install -e .`**, es decir después del paso que ya había reventado. La validación se movió **antes** del install (fail-fast) en `ci.yml` y `release.yml`.
+- **Fallo latente de CI (no estaba en el plan):** el paso "Validate all generated notebooks" ejecuta `scripts/check_notebook_schema.py`, que importa `nbformat`, pero `nbformat` no se instalaba en CI → ese paso habría fallado con `ModuleNotFoundError`. `nbformat` se añadió al extra `dev`.
+- **Deriva de versión:** `__init__.py` quedaba en `0.4.0`; ahora sigue al manifiesto.
+
+### Added
+
+- **P0-2 — extras documentados restaurados.** `[project.optional-dependencies]` solo tenía `dev`, pero README y notebooks instruyen `voicelegacy[similarity|finetune|deepfilter|all]`. Restaurados: `similarity = ["resemblyzer"]`, `finetune = ["faster-whisper>=1.0,<2.0"]`, `deepfilter = ["deepfilternet>=0.5"]`, y `all` como meta-extra **auto-referencial** (`voicelegacy[similarity,finetune,deepfilter]`) para no duplicar specs.
+- **`pre-commit run --all-files` en CI.** Hace que los hooks locales (TOML válido, schema de notebook, no `runtime.unassign()` ejecutable) se cumplan de verdad y no solo en teoría. Es ahora la única fuente de verdad para lint+format (se eliminaron los pasos `ruff` duplicados en `ci.yml`).
+- **`tests/test_packaging.py`** — test de contrato que parsea el manifiesto real y afirma: TOML válido, los 4 extras existen y no están vacíos, `all` es la unión de los extras de features, versión sincronizada con `__version__`, y piso de cobertura presente. Blinda P0-1/P0-2/P0-5 contra regresión silenciosa.
+- **`pre-commit>=3.7,<5.0`** añadido al extra `dev`.
+
+### Changed
+
+- **P0-3 — distribución resuelta.** Los notebooks instalaban `voicelegacy==0.4.0` desde PyPI, pero el paquete **no está publicado en PyPI** (404). Las 3 celdas de instalación afectadas (bridge, finetune, finetune-standalone) ahora instalan desde el tag de GitHub: `pip install git+https://github.com/EnriqueForero/voicelegacy.git@v0.4.1`. El README se alineó al mismo método. (El notebook principal ya instalaba desde una carpeta en Drive; no se tocó.)
+- **P0-5 — piso de cobertura unificado.** README prometía 75% y `pyproject.toml` imponía `--cov-fail-under=25`. Una sola verdad: piso a **80** (cobertura real medida: 86.7%). README corregido.
+- **P0-4 — `ruff` pineado.** `ruff>=0.9.0` (sin tope, CI no reproducible) → `ruff==0.15.16` en el extra `dev` y en `.pre-commit-config.yaml` (migrado al hook id moderno `ruff-check`). Los notebooks `*.ipynb` se excluyen del lint y del whitespace-fixing (`extend-exclude`): son artefactos generados, se validan por schema, no se lintean como fuente. Esto elimina los 73 errores de ruff (todos en `.ipynb`) y los archivos "reformatables".
+
+### Verified
+
+- `pip install -e .` deja de fallar; `import voicelegacy` funciona.
+- **238 tests verdes** (los 6 nuevos de contrato incluidos), cobertura **86.7%**.
+- `pre-commit run --all-files`: **todos los hooks verdes**, incluido `validate-pyproject-toml` que antes nunca corría.
+- `ruff check .` y `ruff format --check .` limpios bajo 0.15.16.
+- Los 4 notebooks regeneran y pasan schema; las celdas de instalación apuntan a `@v0.4.1`.
+
+
 
 Salto MINOR (0.3.3 → 0.4.0): API pública nueva + cambios de comportamiento en defaults de limpieza. Atiende los hallazgos críticos de la auditoría externa de v0.3.3.
 

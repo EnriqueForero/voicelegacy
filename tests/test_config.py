@@ -89,3 +89,26 @@ def test_p1_synthesis_defaults_are_reproducible() -> None:
         SynthesisConfig(temperature=1.2)
     with pytest.raises(ValidationError):
         ReferenceConfig(target_loudness_lufs=-12.0)
+
+
+# ─── Conditioning knobs (v0.7.1) ────────────────────────────────────
+def test_conditioning_knob_defaults_match_upstream_xtts_config() -> None:
+    """Defaults must mirror upstream XttsConfig (12/4/10/False) so the cached
+    and fallback synthesis paths condition identically out of the box."""
+    from voicelegacy.config import SynthesisConfig
+
+    cfg = SynthesisConfig()
+    assert cfg.gpt_cond_len == 12
+    assert cfg.gpt_cond_chunk_len == 4
+    assert cfg.max_ref_len == 10
+    assert cfg.sound_norm_refs is False
+
+
+def test_gpt_cond_chunk_len_must_not_exceed_gpt_cond_len() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from voicelegacy.config import SynthesisConfig
+
+    with pytest.raises(ValidationError):
+        SynthesisConfig(gpt_cond_len=6, gpt_cond_chunk_len=8)

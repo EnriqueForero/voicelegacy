@@ -148,8 +148,14 @@ def _apply_seed(seed: int | None) -> None:
     logger.debug("Seeded inference with seed={}", seed)
 
 
-def _conditioning_cache_key(reference_wavs: list[str]) -> str:
-    """Build a stable key from reference paths plus file metadata."""
+def _conditioning_cache_key(reference_wavs: list[str], config: SynthesisConfig) -> str:
+    """Build a stable key from reference paths, file metadata and conditioning knobs.
+
+    The conditioning knobs are part of the key because different
+    ``gpt_cond_len`` / ``max_ref_len`` / etc. produce *different* latents for
+    the same reference files — omitting them would silently serve stale
+    latents after a config change.
+    """
     h = hashlib.sha256()
     for raw in sorted(reference_wavs):
         p = Path(raw)
@@ -157,6 +163,11 @@ def _conditioning_cache_key(reference_wavs: list[str]) -> str:
         h.update(str(p.resolve()).encode("utf-8"))
         h.update(str(stat.st_size).encode("ascii"))
         h.update(str(stat.st_mtime_ns).encode("ascii"))
+    knobs = (
+        f"gcl={config.gpt_cond_len}|gccl={config.gpt_cond_chunk_len}"
+        f"|mrl={config.max_ref_len}|snr={config.sound_norm_refs}"
+    )
+    h.update(knobs.encode("ascii"))
     return h.hexdigest()
 
 
@@ -171,17 +182,38 @@ def _extract_xtts_model(tts: Any) -> Any | None:
     return model
 
 
-def _get_conditioning_latents_cached(model: Any, reference_wavs: list[str]) -> tuple[Any, Any]:
-    """Get or compute XTTS speaker conditioning latents for a reference set."""
-    key = _conditioning_cache_key(reference_wavs)
+def _get_conditioning_latents_cached(
+    model: Any, reference_wavs: list[str], config: SynthesisConfig
+) -> tuple[Any, Any]:
+    """Get or compute XTTS speaker conditioning latents for a reference set.
+
+    Passes the conditioning knobs explicitly. Before v0.7.1 this call used
+    the raw ``get_conditioning_latents`` defaults (``gpt_cond_len=6``,
+    ``max_ref_length=30``) while the ``tts_to_file`` fallback used
+    XttsConfig's (12 / 10) — the same corpus produced two different voices
+    depending on which path ran. Both paths now honor ``SynthesisConfig``.
+    """
+    key = _conditioning_cache_key(reference_wavs, config)
     if key in _CONDITIONING_LATENTS_CACHE:
         logger.info("Using cached XTTS conditioning latents: {}", key[:8])
         return _CONDITIONING_LATENTS_CACHE[key]
 
     logger.info(
-        "Computing XTTS conditioning latents for {} reference file(s)...", len(reference_wavs)
+        "Computing XTTS conditioning latents for {} reference file(s) "
+        "(gpt_cond_len={}s, chunk={}s, max_ref_len={}s, sound_norm={})...",
+        len(reference_wavs),
+        config.gpt_cond_len,
+        config.gpt_cond_chunk_len,
+        config.max_ref_len,
+        config.sound_norm_refs,
     )
-    latents = model.get_conditioning_latents(audio_path=reference_wavs)
+    latents = model.get_conditioning_latents(
+        audio_path=reference_wavs,
+        gpt_cond_len=config.gpt_cond_len,
+        gpt_cond_chunk_len=config.gpt_cond_chunk_len,
+        max_ref_length=config.max_ref_len,
+        sound_norm_refs=config.sound_norm_refs,
+    )
     if not isinstance(latents, tuple) or len(latents) != 2:
         raise RuntimeError("XTTS get_conditioning_latents returned an unexpected value")
     _CONDITIONING_LATENTS_CACHE[key] = latents
@@ -226,7 +258,7 @@ def _try_synthesize_with_conditioning_cache(
 
     try:
         gpt_cond_latent, speaker_embedding = _get_conditioning_latents_cached(
-            model, speaker_wav_list
+            model, speaker_wav_list, config
         )
         text_plan = plan_text_synthesis(text, config)
         if text_plan.warning:
@@ -335,6 +367,12 @@ def synthesize_to_file(
             top_k=config.top_k,
             top_p=config.top_p,
             speed=config.speed,
+            # Conditioning knobs — model.synthesize pops exactly these names,
+            # so the fallback now conditions identically to the cached path.
+            gpt_cond_len=config.gpt_cond_len,
+            gpt_cond_chunk_len=config.gpt_cond_chunk_len,
+            max_ref_len=config.max_ref_len,
+            sound_norm_refs=config.sound_norm_refs,
         )
 
     logger.info("Wrote {} ({} Hz)", output_path, XTTS_OUTPUT_SR)

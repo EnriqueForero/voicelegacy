@@ -192,7 +192,10 @@ class TestSynthesizeCommandExecution:
 
         ws = _make_workspace(tmp_path)
         for i in range(3):
-            (ws / "reference_corpus" / f"ref_{i}.wav").write_bytes(b"ref")
+            # Real (short) WAVs: select_reference_wavs must be able to decode
+            # them; being under the 6 s duration gate they exercise the
+            # fallback-to-all path, so the batch still receives all 3.
+            _write_pcm_wav(ws / "reference_corpus" / f"ref_{i}.wav", 16000, 1.0)
         text_file = ws / "texts.txt"
         text_file.write_text("hola\nadios\n", encoding="utf-8")
         wav = ws / "synthesis_out" / "hola.wav"
@@ -234,3 +237,214 @@ class TestSynthesizeCommandExecution:
 
         assert result.exit_code == 0, result.output
         assert '"ready": true' in result.output
+
+
+# ─── benchmark ─────────────────────────────────────────────────────
+class TestBenchmarkCommand:
+    def test_help_works(self) -> None:
+        result = runner.invoke(app, ["benchmark", "--help"])
+        assert result.exit_code == 0
+        assert "golden" in result.output.lower()
+
+    def test_fails_without_reference_corpus(self, tmp_path: Path) -> None:
+        ws = _make_workspace(tmp_path)
+        result = runner.invoke(app, ["benchmark", "--workspace", str(ws), "--accept-tos"])
+        assert result.exit_code == 2
+        assert "No reference WAVs" in result.output
+
+    def test_runs_end_to_end_with_mocked_model(self, tmp_path: Path, monkeypatch) -> None:
+        import voicelegacy.synthesis as synthesis
+
+        ws = _make_workspace(tmp_path)
+        # two reference WAVs so SECS pre-flight is satisfied
+        _write_pcm_wav(ws / "reference_corpus" / "r0.wav", 16000, 1.0)
+        _write_pcm_wav(ws / "reference_corpus" / "r1.wav", 16000, 1.0)
+
+        # tiny custom golden set keeps the run fast and deterministic
+        golden = tmp_path / "g.txt"
+        golden.write_text("short\tHola abuela.\nshort\tComo estas hoy.\n", encoding="utf-8")
+
+        # Mock the heavy XTTS surface: load returns a sentinel, synthesize writes
+        # a short WAV to the requested path, release is a no-op.
+        monkeypatch.setattr(synthesis, "load_xtts_model", lambda config, accept_tos: object())
+        monkeypatch.setattr(synthesis, "release_model", lambda: None)
+
+        def _fake_synth(tts, text, speaker_wav, output_path, config):
+            _write_pcm_wav(Path(output_path), 24000, 0.5)
+            return Path(output_path)
+
+        monkeypatch.setattr(synthesis, "synthesize_to_file", _fake_synth)
+
+        result = runner.invoke(
+            app,
+            [
+                "benchmark",
+                "--workspace",
+                str(ws),
+                "--texts",
+                str(golden),
+                "--no-ecapa",
+                "--no-resemblyzer",
+                "--no-wer",
+                "--no-mos",
+                "--accept-tos",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Benchmark" in result.output
+        assert "report=" in result.output
+        reports = list((ws / "reports").glob("benchmark_*.json"))
+        assert len(reports) == 1
+        loaded = json.loads(reports[0].read_text(encoding="utf-8"))
+        assert loaded["summary"]["n_samples"] == 2
+
+
+# ─── synthesize-long ───────────────────────────────────────────────
+class TestSynthesizeLongCommand:
+    def test_help_works(self) -> None:
+        result = runner.invoke(app, ["synthesize-long", "--help"])
+        assert result.exit_code == 0
+        assert "continuous" in result.output.lower()
+
+    def test_requires_exactly_one_text_source(self, tmp_path: Path) -> None:
+        ws = _make_workspace(tmp_path)
+        # neither --text nor --text-file
+        r1 = runner.invoke(
+            app, ["synthesize-long", "--workspace", str(ws), "--out", str(tmp_path / "o.wav")]
+        )
+        assert r1.exit_code == 2
+        assert "exactly one" in r1.output.lower()
+
+    def test_fails_without_reference_corpus(self, tmp_path: Path) -> None:
+        ws = _make_workspace(tmp_path)
+        result = runner.invoke(
+            app,
+            [
+                "synthesize-long",
+                "--workspace",
+                str(ws),
+                "--out",
+                str(tmp_path / "o.wav"),
+                "--text",
+                "Hola.",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "No reference WAVs" in result.output
+
+    def test_missing_text_file(self, tmp_path: Path) -> None:
+        ws = _make_workspace(tmp_path)
+        _write_pcm_wav(ws / "reference_corpus" / "r0.wav", 16000, 1.0)
+        result = runner.invoke(
+            app,
+            [
+                "synthesize-long",
+                "--workspace",
+                str(ws),
+                "--out",
+                str(tmp_path / "o.wav"),
+                "--text-file",
+                str(tmp_path / "ghost.txt"),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "not found" in result.output.lower()
+
+    def test_end_to_end_with_mocked_model(self, tmp_path: Path, monkeypatch) -> None:
+        import voicelegacy.synthesis as synthesis
+
+        ws = _make_workspace(tmp_path)
+        _write_pcm_wav(ws / "reference_corpus" / "r0.wav", 16000, 1.0)
+
+        monkeypatch.setattr(synthesis, "load_xtts_model", lambda config, accept_tos: object())
+        monkeypatch.setattr(synthesis, "release_model", lambda: None)
+
+        def _fake_synth(tts, text, speaker_wav, output_path, config):
+            _write_pcm_wav(Path(output_path), 24000, 0.4)
+            return Path(output_path)
+
+        monkeypatch.setattr(synthesis, "synthesize_to_file", _fake_synth)
+
+        out = tmp_path / "chapter.wav"
+        result = runner.invoke(
+            app,
+            [
+                "synthesize-long",
+                "--workspace",
+                str(ws),
+                "--out",
+                str(out),
+                "--text",
+                "Hola abuela. ¿Cómo estás hoy? Vino el lunes y se fue el martes.",
+                "--no-asr-verify",
+                "--accept-tos",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+        assert out.with_suffix(".sidecar.json").exists()
+        assert "Long-form synthesis" in result.output
+        sidecar = json.loads(out.with_suffix(".sidecar.json").read_text(encoding="utf-8"))
+        assert sidecar["summary"]["n_chunks"] == 3
+
+    def test_text_file_input(self, tmp_path: Path, monkeypatch) -> None:
+        import voicelegacy.synthesis as synthesis
+
+        ws = _make_workspace(tmp_path)
+        _write_pcm_wav(ws / "reference_corpus" / "r0.wav", 16000, 1.0)
+        txt = tmp_path / "in.txt"
+        txt.write_text("Primera oración. Segunda oración aquí.", encoding="utf-8")
+
+        monkeypatch.setattr(synthesis, "load_xtts_model", lambda config, accept_tos: object())
+        monkeypatch.setattr(synthesis, "release_model", lambda: None)
+        monkeypatch.setattr(
+            synthesis,
+            "synthesize_to_file",
+            lambda tts, text, sw, op, cfg: (_write_pcm_wav(Path(op), 24000, 0.3), Path(op))[1],
+        )
+
+        out = tmp_path / "o.wav"
+        result = runner.invoke(
+            app,
+            [
+                "synthesize-long",
+                "--workspace",
+                str(ws),
+                "--out",
+                str(out),
+                "--text-file",
+                str(txt),
+                "--no-asr-verify",
+                "--accept-tos",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+
+
+# ─── _config_for_attempt (v0.7.1) ───────────────────────────────────
+class TestConfigForAttempt:
+    def test_attempt_zero_returns_same_object(self) -> None:
+        from voicelegacy.cli import _config_for_attempt
+        from voicelegacy.config import SynthesisConfig
+
+        cfg = SynthesisConfig(seed=42)
+        assert _config_for_attempt(cfg, 0) is cfg
+
+    def test_retries_derive_seed_from_base_plus_attempt(self) -> None:
+        from voicelegacy.cli import _config_for_attempt
+        from voicelegacy.config import SynthesisConfig
+
+        cfg = SynthesisConfig(seed=42)
+        derived = _config_for_attempt(cfg, 2)
+        assert derived.seed == 44
+        assert cfg.seed == 42  # base config untouched
+        assert derived.temperature == cfg.temperature  # everything else copied
+
+    def test_seed_none_stays_none(self) -> None:
+        from voicelegacy.cli import _config_for_attempt
+        from voicelegacy.config import SynthesisConfig
+
+        cfg = SynthesisConfig(seed=None)
+        assert _config_for_attempt(cfg, 3) is cfg

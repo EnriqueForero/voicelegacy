@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voicelegacy"
-version = "0.4.0"
+version = "0.7.1"
 description = "Voice cloning pipeline for family legacy — XTTS-v2 + speakerscribe integration, optimized for Google Colab Free Tier (T4 GPU). Builds curated reference corpora from diarized interviews and synthesizes new speech in the target speaker's voice."
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,7 +41,46 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "pytest-mock>=3.12", "ruff>=0.9.0", "mypy>=1.10"]
+# Tooling for contributors and CI. pre-commit + nbformat are required so the
+# CI quality gate can actually run the local hooks and notebook-schema check
+# (previously nbformat was imported by scripts/check_notebook_schema.py but
+# never installed, so that CI step would crash).
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.12",
+    "ruff==0.15.16",
+    "mypy>=1.10",
+    "pre-commit>=3.7,<5.0",
+    "nbformat>=5.10",
+]
+# Speaker-similarity validation (Resemblyzer voice encoder). Imported lazily in
+# voicelegacy/similarity.py and voicelegacy/finetune_dataset.py.
+similarity = ["resemblyzer"]
+# Fine-tuning dataset builder: word-level timestamps via faster-whisper.
+finetune = ["faster-whisper>=1.0,<2.0"]
+# Optional DeepFilterNet denoiser, invoked as the `deepFilter` CLI by
+# voicelegacy/denoise_eval.py. Version floor is provisional and should be
+# pinned exactly once validated on the target Colab T4 image.
+deepfilter = ["deepfilternet>=0.5"]
+# Evaluation harness (voicelegacy.evaluation). All of these are imported lazily
+# and degrade to "skipped" if absent, so they are intentionally NOT in the base
+# install. Version floors are provisional and should be pinned exactly once
+# validated on the target Colab T4 image: speechbrain (ECAPA SECS), torchaudio
+# (SQUIM MOS proxy, SQUIM_OBJECTIVE needs >=2.1), faster-whisper (WER ASR),
+# num2words (Spanish number normalization for WER), pandas+pyarrow (cumulative
+# parquet; without them the harness falls back to JSONL).
+eval = [
+    "speechbrain>=1.0",
+    "torchaudio>=2.1",
+    "faster-whisper>=1.0,<2.0",
+    "num2words>=0.5",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
+# Convenience meta-extra. Self-referential (PEP 621) to stay DRY: `all` always
+# equals the union of the feature extras with no duplicated version specifiers.
+all = ["voicelegacy[similarity,finetune,deepfilter,eval]"]
 
 [project.urls]
 Homepage      = "https://github.com/EnriqueForero/voicelegacy"
@@ -51,12 +90,15 @@ Documentation = "https://github.com/EnriqueForero/voicelegacy"
 Changelog     = "https://github.com/EnriqueForero/voicelegacy/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
-where   = [".]
+where   = ["."]
 include = ["voicelegacy*"]
 exclude = ["tests*", "notebooks*", "docs*"]
 
 [tool.setuptools.package-data]
-"voicelegacy" = ["py.typed"]
+# py.typed marks the package as typed (PEP 561). data/*.txt ships the golden
+# stimulus set so `voicelegacy benchmark` finds its default corpus when
+# installed as a wheel (importlib.resources reads it from the package).
+"voicelegacy" = ["py.typed", "data/*.txt"]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -65,7 +107,7 @@ exclude = ["tests*", "notebooks*", "docs*"]
 [tool.pytest.ini_options]
 testpaths    = ["tests"]
 python_files = ["test_*.py"]
-addopts      = "-v --tb=short --strict-markers --cov=voicelegacy --cov-report=term-missing --cov-report=xml --cov-fail-under=25"
+addopts      = "-v --tb=short --strict-markers --cov=voicelegacy --cov-report=term-missing --cov-report=xml --cov-fail-under=80"
 markers = [
     "paridad: test de paridad binaria contra valores congelados",
     "canario: test canario con datos externos (requiere variable de entorno)",
@@ -107,6 +149,10 @@ exclude_lines = [
 [tool.ruff]
 line-length    = 100
 target-version = "py310"
+# Generated notebooks are validated against the nbformat schema (see
+# scripts/check_notebook_schema.py), not linted as source. Their Python cells
+# are emitted by the notebooks/build_*.py generators, which ARE linted.
+extend-exclude = ["notebooks/*.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "RUF"]

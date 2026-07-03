@@ -448,7 +448,8 @@ speakerscribe (diariza) \u2192 ESTE NOTEBOOK (extrae la voz de la abuela)
     _code(
         """from google.colab import drive
 drive.mount("/content/drive")
-!pip install -q voicelegacy=={version}
+# voicelegacy no está publicado en PyPI: se instala desde el tag de GitHub.
+!pip install -q git+https://github.com/EnriqueForero/voicelegacy.git@v{version}
 import voicelegacy
 print("voicelegacy", voicelegacy.__version__)""".replace("{version}", VERSION)
     ),

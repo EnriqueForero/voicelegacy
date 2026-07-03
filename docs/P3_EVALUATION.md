@@ -2,6 +2,45 @@
 
 P3 is product improvement, not a prerequisite for basic operation. Do not make a new denoise model or text-splitting policy the default without evidence from real source material.
 
+## Fidelity benchmark (the output-side gate)
+
+The reference-phase quality gates score the *input* corpus; nothing there scores
+the *output*. `voicelegacy.evaluation` + `voicelegacy benchmark` close that gap.
+
+Architecture: synthesis is injected as a callable `(text) -> (waveform, sr)`, so
+the harness runs with the real XTTS model on a T4 or with a mock in tests — it
+never imports a TTS engine itself. Each metric is optional and degrades to
+`skipped` when its dependency is missing.
+
+Metrics:
+
+- **SECS** — ECAPA-TDNN cosine against the centroid of the reference embeddings
+  (primary), Resemblyzer as a cheap second opinion. The two encoders are on
+  different scales; calibrate ECAPA bands on your own corpus and never reuse
+  Resemblyzer's bands for ECAPA.
+- **WER / CER** — faster-whisper transcribes the output; we compare against the
+  requested text with a Spanish-aware normalizer (NFC, optional number
+  expansion, punctuation/whitespace canonicalization). This is the only cheap
+  detector of silent truncation / hallucination / eaten words on long text.
+- **MOS proxy** — TorchAudio-SQUIM objective (PESQ / STOI / SI-SDR), no clean
+  reference required. A consistent proxy, not ground truth.
+- **RTF** and **peak VRAM** — from `voicelegacy.telemetry`.
+
+Install the dependencies and run:
+
+```bash
+pip install "voicelegacy[eval] @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.5.0"
+voicelegacy benchmark --workspace /path/to/workspace --accept-tos
+```
+
+Outputs: `reports/benchmark_<run>.json` (per-sample detail + aggregates),
+`reports/benchmarks.parquet` (cross-run accumulation; JSONL fallback without
+pandas), and the synthesized audio under `reports/benchmark_audio/<run>/`.
+
+**Golden rule.** Freeze one baseline run on a T4 against the real corpus, then
+re-run after every precision change and compare. No precision change ships
+without a benchmark number.
+
 ## DeepFilterNet versus noisereduce
 
 DeepFilterNet is optional. The package extra is:

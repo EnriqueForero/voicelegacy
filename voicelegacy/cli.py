@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -29,10 +30,34 @@ from voicelegacy.pipeline import (
     run_batch_synthesis,
     run_reference_phase,
 )
+from voicelegacy.quality import select_reference_wavs
 from voicelegacy.text_inputs import resolve_text_inputs
 
 app = typer.Typer(help="Voice cloning pipeline for family legacy — XTTS-v2 + speakerscribe.")
 console = Console()
+
+
+def _config_for_attempt(config: SynthesisConfig, attempt: int) -> SynthesisConfig:
+    """Derive the per-attempt SynthesisConfig for long-form retry re-rolls.
+
+    ``synthesize_to_file`` re-seeds the RNG to ``config.seed`` before every
+    inference, so with a fixed seed every retry reproduces the exact same
+    failing audio and the retry budget is wasted. Deriving ``seed + attempt``
+    makes each re-roll a genuinely different draw while remaining fully
+    reproducible: the sidecar records which attempt was kept (``retries``),
+    so ``base_seed + retries`` recreates the published audio byte-for-byte.
+
+    Args:
+        config: Base synthesis config.
+        attempt: 0-based attempt index (0 = first try).
+
+    Returns:
+        The same object for attempt 0 or when seeding is disabled; otherwise
+        a copy with ``seed = base_seed + attempt``.
+    """
+    if attempt == 0 or config.seed is None:
+        return config
+    return config.model_copy(update={"seed": config.seed + attempt})
 
 
 @app.callback()
@@ -86,12 +111,21 @@ def synthesize(
         None, "--text-file", help=".txt one utterance per line, or .csv with a text column."
     ),
     language: str = typer.Option("es", help="Language ISO code."),
+    top_n: int | None = typer.Option(
+        None,
+        "--top-n",
+        help=(
+            "Use only the N best-quality reference WAVs for voice conditioning "
+            "(default: ReferenceConfig.top_n_segments = 5). 0 = legacy: all "
+            "WAVs, alphabetical."
+        ),
+    ),
     accept_tos: bool = typer.Option(False, "--accept-tos", help="Accept Coqui CPML license."),
     force: bool = typer.Option(False, "--force", help="Re-run even if cached."),
 ) -> None:
     """Synthesize one or more texts using the existing reference corpus."""
     paths = WorkspacePaths(workspace=workspace)
-    top_wavs = sorted(paths.reference_corpus.glob("*.wav"))
+    top_wavs = select_reference_wavs(paths.reference_corpus, top_n=top_n)
     if not top_wavs:
         console.print("[red]No reference WAVs found. Run 'build-corpus' first.[/red]")
         raise typer.Exit(code=2)
@@ -308,6 +342,256 @@ def evaluate_denoise(
         )
     console.print(table)
     console.print(f"report={report['report_path']}")
+
+
+@app.command("benchmark")
+def benchmark(
+    workspace: Path = typer.Option(..., help="Workspace root with reference_corpus/ and reports/."),
+    texts: Path | None = typer.Option(
+        None, "--texts", help="golden_texts_es.txt-formatted file. Defaults to the packaged set."
+    ),
+    language: str = typer.Option("es", help="Language ISO code passed to synthesis + ASR."),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Only run the first N stimuli (quick smoke). Default: all."
+    ),
+    no_ecapa: bool = typer.Option(False, "--no-ecapa", help="Skip ECAPA speaker similarity."),
+    no_resemblyzer: bool = typer.Option(False, "--no-resemblyzer", help="Skip Resemblyzer SECS."),
+    no_wer: bool = typer.Option(False, "--no-wer", help="Skip the WER round-trip (ASR)."),
+    no_mos: bool = typer.Option(False, "--no-mos", help="Skip the SQUIM MOS proxy."),
+    accept_tos: bool = typer.Option(False, "--accept-tos", help="Accept Coqui CPML license."),
+) -> None:
+    """Benchmark the current voice against the golden stimulus set.
+
+    Synthesizes each stimulus with the real XTTS model and reference corpus,
+    then scores fidelity (SECS, WER/CER, MOS proxy) and speed (RTF, peak VRAM).
+    Writes reports/benchmark_<run>.json and appends reports/benchmarks.parquet.
+    Run it once to freeze a baseline, then re-run after every precision change.
+    """
+    import tempfile
+
+    import soundfile as sf
+
+    from voicelegacy.evaluation import (
+        BenchmarkConfig,
+        append_to_cumulative,
+        load_golden_texts,
+        run_benchmark,
+    )
+    from voicelegacy.synthesis import load_xtts_model, release_model, synthesize_to_file
+
+    paths = WorkspacePaths(workspace=workspace)
+    top_wavs = sorted(paths.reference_corpus.glob("*.wav"))
+    if not top_wavs:
+        console.print("[red]No reference WAVs found. Run 'build-corpus' first.[/red]")
+        raise typer.Exit(code=2)
+
+    try:
+        stimuli = load_golden_texts(texts)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    if limit is not None:
+        stimuli = stimuli[:limit]
+
+    synth_cfg = SynthesisConfig(language=language)  # type: ignore[arg-type]
+    config = BenchmarkConfig(
+        compute_secs_ecapa=not no_ecapa,
+        compute_secs_resemblyzer=not no_resemblyzer,
+        compute_wer=not no_wer,
+        compute_mos=not no_mos,
+        asr_language=language,
+    )
+
+    tts = load_xtts_model(synth_cfg, accept_tos=accept_tos)
+
+    def _synthesize(text: str) -> tuple[Any, int]:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            tmp_path = Path(handle.name)
+        try:
+            synthesize_to_file(tts, text, top_wavs, tmp_path, synth_cfg)
+            wav, sr = sf.read(str(tmp_path), dtype="float32", always_2d=False)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return wav, sr
+
+    try:
+        report = run_benchmark(
+            _synthesize,
+            stimuli,
+            top_wavs,
+            audio_dir=paths.reports / "benchmark_audio",
+            config=config,
+            notes={"language": language, "n_reference_wavs": len(top_wavs)},
+        )
+    finally:
+        release_model()
+
+    json_path = report.write_json(paths.reports / f"benchmark_{report.run_id}.json")
+    cumulative = append_to_cumulative(report, paths.reports / "benchmarks.parquet")
+
+    summary = report.summary()
+    table = Table(title=f"Benchmark {report.run_id} — {summary['n_samples']} stimuli")
+    table.add_column("Metric")
+    table.add_column("ok", justify="right")
+    table.add_column("skipped", justify="right")
+    table.add_column("mean", justify="right")
+    table.add_column("median", justify="right")
+    for name, info in summary["metrics"].items():
+        stats = info["stats"] or {}
+        table.add_row(
+            name,
+            str(info["n_ok"]),
+            str(info["n_skipped"]),
+            f"{stats.get('mean', '—')}",
+            f"{stats.get('median', '—')}",
+        )
+    rtf = summary["rtf"] or {}
+    table.add_row(
+        "rtf", str(rtf.get("n", 0)), "0", f"{rtf.get('mean', '—')}", f"{rtf.get('median', '—')}"
+    )
+    console.print(table)
+    console.print(f"report={json_path}")
+    console.print(f"cumulative={cumulative}")
+    console.print(
+        "[yellow]Baseline note:[/yellow] freeze this run as the 'before' number. "
+        "No precision change should ship without re-running this and comparing."
+    )
+
+
+@app.command("synthesize-long")
+def synthesize_long(
+    workspace: Path = typer.Option(..., help="Workspace root with reference_corpus/."),
+    out: Path = typer.Option(..., "--out", help="Output WAV path. Sidecar written alongside."),
+    text: str | None = typer.Option(None, "--text", help="Inline text to synthesize."),
+    text_file: Path | None = typer.Option(
+        None, "--text-file", help="UTF-8 text file to synthesize (alternative to --text)."
+    ),
+    language: str = typer.Option("es", help="Language ISO code."),
+    max_chunk_chars: int = typer.Option(
+        220, "--max-chunk-chars", help="Max characters per synthesis chunk (XTTS limit margin)."
+    ),
+    max_wer: float = typer.Option(
+        0.15, "--max-wer", help="WER ceiling above which a chunk is retried."
+    ),
+    max_retries: int = typer.Option(2, "--max-retries", help="Re-rolls per failing chunk."),
+    no_asr_verify: bool = typer.Option(
+        False, "--no-asr-verify", help="Skip ASR verification (faster, less robust)."
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Reuse cached chunks if present."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Clear the chunk cache and re-synthesize all."
+    ),
+    top_n: int | None = typer.Option(
+        None,
+        "--top-n",
+        help=(
+            "Use only the N best-quality reference WAVs for voice conditioning "
+            "(default: ReferenceConfig.top_n_segments = 5). 0 = legacy: all "
+            "WAVs, alphabetical."
+        ),
+    ),
+    accept_tos: bool = typer.Option(False, "--accept-tos", help="Accept Coqui CPML license."),
+) -> None:
+    """Synthesize long text (paragraphs, chapters) as one continuous, verified WAV.
+
+    Chunks the text at sentence/clause boundaries under the XTTS character limit,
+    synthesizes each chunk reusing the same speaker conditioning (so the voice
+    does not drift), ASR-verifies and retries failures, then joins the chunks
+    with equal-power crossfades and punctuation-based pauses. Resumable: an
+    interrupted run continues from its per-chunk cache. Writes <out>.sidecar.json
+    with per-chunk WER, retries and any flagged chunks.
+    """
+    import tempfile
+
+    import soundfile as sf
+
+    from voicelegacy.longform import LongFormConfig, LongFormSynthesizer
+    from voicelegacy.synthesis import load_xtts_model, release_model, synthesize_to_file
+
+    if (text is None) == (text_file is None):
+        console.print("[red]Provide exactly one of --text or --text-file.[/red]")
+        raise typer.Exit(code=2)
+    if text_file is not None:
+        if not text_file.exists():
+            console.print(f"[red]Text file not found: {text_file}[/red]")
+            raise typer.Exit(code=2)
+        text = text_file.read_text(encoding="utf-8")
+    assert text is not None  # narrowed by the checks above
+    if not text.strip():
+        console.print("[red]Input text is empty.[/red]")
+        raise typer.Exit(code=2)
+
+    paths = WorkspacePaths(workspace=workspace)
+    top_wavs = select_reference_wavs(paths.reference_corpus, top_n=top_n)
+    if not top_wavs:
+        console.print("[red]No reference WAVs found. Run 'build-corpus' first.[/red]")
+        raise typer.Exit(code=2)
+
+    synth_cfg = SynthesisConfig(language=language)  # type: ignore[arg-type]
+    config = LongFormConfig(
+        max_chunk_chars=max_chunk_chars,
+        max_wer=max_wer,
+        max_retries=max_retries,
+        asr_verify=not no_asr_verify,
+        language=language,
+    )
+
+    tts = load_xtts_model(synth_cfg, accept_tos=accept_tos)
+
+    def _synthesize(chunk_text: str, attempt: int = 0) -> tuple[Any, int]:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            tmp_path = Path(handle.name)
+        try:
+            # synthesize_to_file reuses cached conditioning latents across calls,
+            # so the speaker timbre stays consistent chunk to chunk. The seed is
+            # derived per attempt (base + attempt) so retry re-rolls actually
+            # sample new audio instead of reproducing the identical failure.
+            synthesize_to_file(
+                tts, chunk_text, top_wavs, tmp_path, _config_for_attempt(synth_cfg, attempt)
+            )
+            wav, sr = sf.read(str(tmp_path), dtype="float32", always_2d=False)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return wav, sr
+
+    synthesizer = LongFormSynthesizer(
+        _synthesize,
+        config,
+        cache_root=paths.synthesis_out / "longform_cache",
+        synthesize_accepts_attempt=True,
+    )
+    try:
+        result = synthesizer.render(
+            text,
+            out,
+            resume=resume,
+            force=force,
+            notes={"language": language, "n_reference_wavs": len(top_wavs)},
+        )
+    finally:
+        release_model()
+
+    summary = result.summary()
+    table = Table(title=f"Long-form synthesis — {summary['n_chunks']} chunks")
+    table.add_column("Field")
+    table.add_column("Value", justify="right")
+    table.add_row("duration", f"{summary['duration_s']}s")
+    table.add_row("chunks", str(summary["n_chunks"]))
+    table.add_row("from cache", str(summary["n_from_cache"]))
+    table.add_row("ASR-verified", str(summary["asr_verified_chunks"]))
+    table.add_row("mean WER", f"{summary['mean_wer']}")
+    table.add_row("flagged", str(summary["n_flagged"]))
+    table.add_row("RTF", f"{summary['rtf']}")
+    console.print(table)
+    console.print(f"output={result.output_path}")
+    console.print(f"sidecar={result.sidecar_path}")
+    if summary["n_flagged"]:
+        console.print(
+            f"[yellow]{summary['n_flagged']} chunk(s) failed verification and were flagged "
+            f"for review (indices {summary['flagged_indices']}). See the sidecar.[/yellow]"
+        )
 
 
 if __name__ == "__main__":

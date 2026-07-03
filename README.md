@@ -66,11 +66,18 @@ etiquetaste mal alguna entrevista).
 
 ### Instalación (para usar la API en código, fuera de los notebooks)
 
+> `voicelegacy` aún no está publicado en PyPI (ver _Packaging and PyPI_ más abajo),
+> por lo que se instala desde el tag de GitHub. Sustituye `v0.7.0` por el tag deseado.
+
 ```bash
-pip install voicelegacy                 # núcleo
-pip install voicelegacy[similarity]     # + Resemblyzer (similarity + coherencia)
-pip install voicelegacy[finetune]       # + faster-whisper (notebook standalone)
-pip install voicelegacy[all]            # todo lo opcional
+# núcleo
+pip install "voicelegacy @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.7.0"
+# + Resemblyzer (similarity + coherencia)
+pip install "voicelegacy[similarity] @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.7.0"
+# + faster-whisper (notebook standalone)
+pip install "voicelegacy[finetune] @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.7.0"
+# todo lo opcional
+pip install "voicelegacy[all] @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.7.0"
 ```
 
 ### Documentos guía
@@ -326,7 +333,7 @@ The release-candidate bar is:
 - ruff format passes.
 - ruff lint passes.
 - pytest passes.
-- coverage floor: 75%.
+- coverage floor: 80% (enforced by `--cov-fail-under=80` in `pyproject.toml`; measured: 83.4%).
 - notebook regenerates and validates.
 - `pyproject.toml` parses.
 
@@ -393,7 +400,92 @@ Current status: release candidate for GitHub testing. It is suitable for technic
 
 ## P3 product hardening
 
-### Denoise evaluation before changing defaults
+### Reference-corpus precision levers (opt-in)
+
+Three correctness controls on the reference corpus. All default to off / current
+behavior — enabling any of them changes which segments are selected, so treat
+them as precision changes: A/B them with `voicelegacy benchmark` before adopting.
+
+- **Conditional denoise** (`ReferenceConfig.denoise_only_if_noisy`,
+  `denoise_snr_threshold_db`): denoise only segments below an estimated dynamic
+  range. Denoising already-clean speech adds artifacts.
+- **Spectral-rolloff bandwidth gate** (`min_spectral_rolloff_hz`, `0` disables):
+  rejects narrowband/telephone audio measured from the signal. The header
+  sample-rate gate cannot catch phone-band audio that was upsampled to 44.1 kHz;
+  this can.
+- **Speaker-overlap (crosstalk) gate** (`enable_overlap_filter`,
+  `max_overlap_ratio`): drops target segments overlapped by other speakers
+  beyond a ratio. Writes `reports/overlap_<ts>.json`.
+
+The cleaning chain itself is now a single function, `audio.clean_segment`, shared
+by corpus extraction and the one-shot `preprocess_full` so they cannot drift.
+
+### Fidelity benchmark (SECS / WER / MOS / RTF)
+
+The quality gates in the reference phase measure the *input* corpus. The
+`benchmark` command measures the *output* — the cloned voice — and turns
+"does it sound like her?" into numbers you can compare across runs.
+
+It synthesizes a frozen golden stimulus set with the real model and reference
+corpus, then scores each sample:
+
+- **SECS** — speaker similarity, ECAPA-TDNN (primary) + Resemblyzer (second
+  opinion). *Note: the two encoders use different scales; do not compare them
+  directly or reuse Resemblyzer's bands for ECAPA.*
+- **WER / CER** — round-trip via faster-whisper ASR; the cheapest detector of
+  silent truncation, hallucination, and eaten words on long text.
+- **MOS proxy** — TorchAudio-SQUIM objective (PESQ / STOI / SI-SDR).
+- **RTF** and **peak VRAM** — speed and memory per sample.
+
+Every metric is optional and degrades to `skipped` if its dependency is absent.
+Install them with the `eval` extra:
+
+```bash
+pip install "voicelegacy[eval] @ git+https://github.com/EnriqueForero/voicelegacy.git@v0.7.0"
+```
+
+Run it (uses the packaged Spanish golden set by default):
+
+```bash
+voicelegacy benchmark --workspace /path/to/workspace --accept-tos
+```
+
+It writes `reports/benchmark_<run>.json` (full per-sample detail + aggregates),
+appends `reports/benchmarks.parquet` for cross-run trends, and persists the
+synthesized audio under `reports/benchmark_audio/<run>/` for human audit.
+
+**Baseline workflow (the golden rule).** Run this once on a T4 against your real
+corpus to **freeze a baseline** — the "before" number for everything. After any
+precision change, re-run and compare. No precision change should ship without a
+benchmark number. The frozen baseline table is produced by *your* T4 run; this
+repository ships the harness and tests, not the numbers (those require a GPU,
+the XTTS weights, and your corpus).
+
+### Long-form synthesis (audiobooks)
+
+XTTS-v2 derails past ~250–270 characters per generation (the high WER on the
+`long`/`chapter` benchmark stimuli). `synthesize-long` produces one continuous,
+verified WAV from arbitrarily long text:
+
+- chunks at sentence/clause boundaries under the character budget (never
+  mid-word; handles Spanish abbreviations, decimals, `¿¡`, ellipsis);
+- reuses the same speaker conditioning across chunks so the voice does not drift;
+- **ASR-verifies each chunk and retries** silent truncation/hallucination, then
+  flags anything irrecoverable in the sidecar (visible failures, not buried);
+- joins chunks with equal-power crossfades and punctuation-based pauses;
+- **resumable** — an interrupted Colab run continues from its per-chunk cache.
+
+```bash
+voicelegacy synthesize-long --workspace /path/to/workspace \
+  --text-file chapter_01.txt --out chapter_01.wav --resume --accept-tos
+```
+
+Writes `chapter_01.wav` and `chapter_01.sidecar.json` (per-chunk WER, retries,
+flagged chunks, RTF, VRAM). Or from Python via `voicelegacy.LongFormSynthesizer`.
+Design and the T4 validation recipe (prove the WER drop vs the baseline) are in
+[`docs/P3_LONGFORM.md`](docs/P3_LONGFORM.md).
+
+
 
 DeepFilterNet is not enabled by default. It is an optional evaluation path because aggressive enhancement can improve perceived noise while damaging speaker identity.
 
